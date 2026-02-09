@@ -28,7 +28,6 @@ jobs:
         include:
           - os: ubuntu-latest
             suffix: linux
-          #  must be a public GitHub repository
           - os: ubuntu-24.04-arm
             suffix: linux-arm64
           - os: macos-15-intel
@@ -84,58 +83,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-
-  build_binaries:
-    name: Build Binaries
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            suffix: linux
-          #  must be a public GitHub repository
-          - os: ubuntu-24.04-arm
-            suffix: linux-arm64
-          - os: macos-15-intel
-            suffix: macos-intel
-          - os: macos-latest
-            suffix: macos-arm
-          - os: windows-latest
-            suffix: windows
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Get crate name
-        id: crate
-        shell: bash
-        run: echo "name=$(grep -m1 '^name' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-
-      - name: Disable Windows Defender (speed up build)
-        if: runner.os == 'Windows'
-        run: |
-          Set-MpPreference -DisableRealtimeMonitoring $true
-        shell: powershell
-
-      - name: Build Binary
-        env:
-          CARGO_INCREMENTAL: 0
-        run: cargo build --release
-
-      - name: Package binary (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          chmod +x "target/release/${{ steps.crate.outputs.name }}"
-          tar -czvf "${{ steps.crate.outputs.name }}-${{ matrix.suffix }}.tar.gz" -C target/release "${{ steps.crate.outputs.name }}"
-
-      - name: Package binary (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          Compress-Archive -Path "target/release/${{ steps.crate.outputs.name }}.exe" -DestinationPath "${{ steps.crate.outputs.name }}-${{ matrix.suffix }}.zip"
-        shell: powershell
-
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
-        with:
-          files: ${{ steps.crate.outputs.name }}-${{ matrix.suffix }}${{ runner.os == 'Windows' && '.zip' || '.tar.gz' }}
