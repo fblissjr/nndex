@@ -9,7 +9,7 @@ Features:
 - CPU backend using [rayon](https://crates.io/crates/rayon) parallelism + SIMD (via [simsimd](https://crates.io/crates/simsimd)), along with highly bespoke compute profiles for maximum CPU performance
 - GPU backend using [wgpu](https://crates.io/crates/wgpu) compute shaders
   - Supports Vulkan, Metal, D3D12, and OpenGL graphics APIs, allowing GPU vector search speed on typical personal computers such as MacBooks with Apple Silicon (Metal)
-- Approximate nearest-neighbor (ANN) mode with exact reranking for sub-millisecond queries for millions of rows
+- Approximate nearest-neighbor (ANN) mode with exact reranking
 - Batch search for multiple queries at once
 - Python bindings via PyO3 with [numpy](https://numpy.org), [pandas](https://pandas.pydata.org), and [polars](https://pola.rs) support
 - Load embeddings directly from `.npy`, `.npz`, and `.parquet` files
@@ -48,9 +48,8 @@ See also the [demo notebooks](https://github.com/minimaxir/nndex/tree/main/noteb
 import numpy as np
 from nndex import NNdex
 
-rows, dims = 50_000, 128
 rng = np.random.default_rng(42)
-matrix = rng.normal(size=(rows, dims)).astype(np.float32)
+matrix = rng.normal(size=(50_000, 128)).astype(np.float32)
 
 # Build an index (auto-selects GPU if available, falls back to CPU)
 index = NNdex(matrix)
