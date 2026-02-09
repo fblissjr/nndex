@@ -8,14 +8,14 @@ Features:
 
 - CPU backend using [rayon](https://crates.io/crates/rayon) parallelism + SIMD (via [simsimd](https://crates.io/crates/simsimd)), along with highly bespoke compute profiles for maximum CPU performance
 - GPU backend using [wgpu](https://crates.io/crates/wgpu) compute shaders
-  - Supports Vulkan, Metal, D3D12, and OpenGL, allowing GPU speed on typical personal computers such as MacBooks with Apple Silicon (Metal)
+  - Supports Vulkan, Metal, D3D12, and OpenGL graphics APIs, allowing GPU vector search speed on typical personal computers such as MacBooks with Apple Silicon (Metal)
 - Approximate nearest-neighbor (ANN) mode with exact reranking for sub-millisecond queries for millions of rows
 - Batch search for multiple queries at once
 - Python bindings via PyO3 with [numpy](https://numpy.org), [pandas](https://pandas.pydata.org), and [polars](https://pola.rs) support
 - Load embeddings directly from `.npy`, `.npz`, and `.parquet` files
 - Internal query-result caching for repeated searches
 
-_**Disclosure:** This library was mostly coded with the assistance of agentic coding LLMs. However, I personally have reviewed all code to ensure it is accurate, have added numerous tests and benchmarks to ensure it works as both intended and advertised, and have edited documentation and comments to provide greater signal as to how the package operates. I have given this project the same care and attention as I would give a project I have written from scratch._
+_**Disclosure:** This library was mostly coded with the assistance of Claude Opus 4.6 and GPT-5.3-Codex as research into the discovery that those models can now successfuly hyperoptimize Rust code. However, I personally have reviewed all code to ensure it is accurate, have added numerous tests and benchmarks to ensure it works as both intended and advertised, and have edited documentation and comments to provide greater signal as to how the package operates. I have given this project the same care and attention as I would give a project I have written from scratch._
 
 ## Installation
 
@@ -84,7 +84,7 @@ print(batch_scores.shape)   # (4, 5)
 
 ### Approximate Nearest Neighbors
 
-Enable `approx=True` for sub-millisecond queries on large matrices (>10000 rows). Uses a dimensionality-reduced prefilter followed by exact reranking.
+Enable `approx=True` for sub-millisecond queries on large matrices (>10000 rows); on smaller matrices, this setting may be ignored due to overhead causing slowdown instead. Uses a dimensionality-reduced prefilter followed by exact reranking.
 
 ```python
 index_ann = NNdex(matrix, approx=True)
