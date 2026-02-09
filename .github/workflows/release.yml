@@ -29,8 +29,8 @@ jobs:
           - os: ubuntu-latest
             suffix: linux
           #  must be a public GitHub repository
-          # - os: ubuntu-24.04-arm
-          #   suffix: linux-arm64
+          - os: ubuntu-24.04-arm
+            suffix: linux-arm64
           - os: macos-15-intel
             suffix: macos-intel
           - os: macos-latest
@@ -42,7 +42,7 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release -i python3.10 --out dist
+          args: --release -i python --out dist
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.suffix }}
@@ -81,7 +81,7 @@ jobs:
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/*
 
@@ -95,8 +95,8 @@ jobs:
           - os: ubuntu-latest
             suffix: linux
           #  must be a public GitHub repository
-          # - os: ubuntu-24.04-arm
-          #   suffix: linux-arm64
+          - os: ubuntu-24.04-arm
+            suffix: linux-arm64
           - os: macos-15-intel
             suffix: macos-intel
           - os: macos-latest
@@ -111,10 +111,6 @@ jobs:
         id: crate
         shell: bash
         run: echo "name=$(grep -m1 '^name' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
       - name: Disable Windows Defender (speed up build)
         if: runner.os == 'Windows'
