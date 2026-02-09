@@ -1,0 +1,64 @@
+[package]
+name = "nndex"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fast cosine-similarity index with CPU and wgpu backends"
+keywords = ["nearest-neighbor", "cosine-similarity", "embedding", "search", "gpu"]
+categories = ["algorithms", "science", "mathematics"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["cpu"]
+cpu = ["dep:rayon", "dep:simsimd"]
+gpu = ["dep:futures-intrusive", "dep:futures-lite", "dep:pollster", "dep:wgpu"]
+python = [
+    "cpu",
+    "gpu",
+    "dep:arrow-array",
+    "dep:ndarray",
+    "dep:ndarray-npy",
+    "dep:numpy",
+    "dep:parquet",
+    "dep:pyo3",
+    "pyo3/auto-initialize",
+]
+python-extension = ["python", "pyo3/extension-module"]
+
+[dependencies]
+anyhow = "1.0.96"
+arrow-array = { version = "54.2.1", optional = true }
+bytemuck = { version = "1.21.0", features = ["derive"] }
+futures-intrusive = { version = "0.5.0", optional = true }
+futures-lite = { version = "2.6.0", optional = true }
+ndarray = { version = "0.16.1", optional = true }
+ndarray-npy = { version = "0.9.1", optional = true }
+numpy = { version = "0.27.0", optional = true }
+parquet = { version = "54.2.1", optional = true, features = ["arrow"] }
+pollster = { version = "0.4.0", optional = true }
+pyo3 = { version = "0.27.2", optional = true }
+rayon = { version = "1.10.0", optional = true }
+simsimd = { version = "6.5.12", optional = true }
+thiserror = "2.0.11"
+wgpu = { version = "28.0.0", optional = true }
+
+[dev-dependencies]
+approx = "0.5.1"
+criterion = { version = "0.5.1", features = ["html_reports"] }
+rand = "0.9.0"
+rand_chacha = "0.9.0"
+indicatif = "0.17.11"
+
+[[bench]]
+name = "fit"
+harness = false
+
+[[bench]]
+name = "predict"
+harness = false
+
+[[bench]]
+name = "batch"
+harness = false

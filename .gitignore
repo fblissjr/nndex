@@ -1,0 +1,31 @@
+.DS_Store
+*.parquet
+*.nosync
+.env
+.venv
+*.csv
+test_notebooks/
+.vscode/
+__pycache__/
+.ipynb_checkpoints
+dist/
+build/
+uv.lock
+AGENTS.md
+CLAUDE.md
+/output
+Cargo.lock
+
+# Added by cargo
+/target
+
+# Python build artifacts
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+wheels/
+*.whl
+*.egg
+*.pyd
