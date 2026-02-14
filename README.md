@@ -7,8 +7,7 @@ A high-performance Rust library with Python bindings for nearest-neighbor vector
 Features:
 
 - CPU backend using [rayon](https://crates.io/crates/rayon) parallelism + SIMD (via [simsimd](https://crates.io/crates/simsimd)), along with highly bespoke compute profiles for maximum CPU performance
-- GPU backend using [wgpu](https://crates.io/crates/wgpu) compute shaders
-  - Supports Vulkan, Metal, D3D12, and OpenGL graphics APIs, allowing GPU vector search speed on typical personal computers such as MacBooks with Apple Silicon (Metal)
+- GPU backend using [wgpu](https://crates.io/crates/wgpu) compute shaders, supporting Vulkan, Metal, D3D12, and OpenGL graphics APIs
 - Approximate nearest-neighbor (ANN) mode with exact reranking
 - Batch search for multiple queries at once
 - Python bindings via PyO3 with [numpy](https://numpy.org), [pandas](https://pandas.pydata.org), and [polars](https://pola.rs) support
@@ -94,14 +93,11 @@ indices, scores = index_ann.search(query, k=5)
 ### Backend Selection
 
 ```python
-# Force CPU
+# CPU (default)
 cpu_index = NNdex(matrix, backend="cpu")
 
 # Force GPU
 gpu_index = NNdex(matrix, backend="gpu")
-
-# Auto-select (default): tries GPU first, falls back to CPU
-auto_index = NNdex(matrix, backend="auto")
 ```
 
 ### Pre-Normalized Data
@@ -192,6 +188,7 @@ fn main() -> Result<(), nndex::NNdexError> {
 
 - nndex is **NOT** a vector store/database which implies that the vectors can be created/updated/deleted from the matrix, and it is not intending to be. It's intended to be used with a fixed matrix of data, although this crate is so fast that you could reinitialize the `NNdex` without much overhead if needed.
 - The approximate mode samples a subset of dimensions (up to 64) for a fast prefilter pass, then reranks the top candidates with exact full-dimensional dot products. For maximum computational efficiency, it only activates when the dimension reduction ratio is >= 3x as otherwise the overhead offsets the benefits of ANN.
+- For Apple Silicon in particular, the use of the GPU backend (Metal) is not recommended due to the dispatch overhead of `wgpu` being greater than the inference speed. This is not the case with discrete GPUs.
 
 ## API Reference
 
@@ -204,7 +201,7 @@ fn main() -> Result<(), nndex::NNdexError> {
 | `data`         | array-like | required | 2D numpy array, list, or pandas/polars DataFrame         |
 | `normalized`   | bool       | `False`  | Skip internal normalization if data is already unit-norm |
 | `approx`       | bool       | `False`  | Enable ANN prefiltering with exact reranking             |
-| `backend`      | str        | `"auto"` | `"auto"`, `"cpu"`, or `"gpu"`                            |
+| `backend`      | str        | `"cpu"`  | `"cpu"`, or `"gpu"`                                      |
 | `enable_cache` | bool       | `True`   | Cache repeated query results                             |
 
 #### `NNdex.from_file(path, ...)`
@@ -215,7 +212,7 @@ fn main() -> Result<(), nndex::NNdexError> {
 | `key`          | str/None | `None`   | Array key (`.npz`) or column name (`.parquet`)           |
 | `normalized`   | bool     | `False`  | Skip internal normalization if data is already unit-norm |
 | `approx`       | bool     | `False`  | Enable ANN prefiltering with exact reranking             |
-| `backend`      | str      | `"auto"` | `"auto"`, `"cpu"`, or `"gpu"`                            |
+| `backend`      | str      | `"cpu"`  | `"cpu"`, or `"gpu"`                                      |
 | `enable_cache` | bool     | `True`   | Cache repeated query results                             |
 
 #### `index.search(query, k=10, dataframe=None)`
@@ -256,7 +253,7 @@ Batch search over multiple query vectors.
 | -------------- | ------------------- | ------- | ------------------------------------------ |
 | `normalized`   | `bool`              | `false` | Skip normalization for pre-normalized data |
 | `approx`       | `bool`              | `false` | Enable ANN prefiltering                    |
-| `backend`      | `BackendPreference` | `Auto`  | `Auto`, `Cpu`, or `Gpu`                    |
+| `backend`      | `BackendPreference` | `Cpu`   | `Cpu`, or `Gpu`                            |
 | `enable_cache` | `bool`              | `true`  | Cache constructor and query results        |
 
 ## Maintainer/Creator
