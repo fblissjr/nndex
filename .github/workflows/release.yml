@@ -28,19 +28,19 @@ jobs:
         include:
           - os: ubuntu-latest
             suffix: linux
-            maturin-args: --release -i python --out dist --features gpu
+            maturin-args: --release -i python --out dist --features python-extension,gpu
           - os: ubuntu-24.04-arm
             suffix: linux-arm64
-            maturin-args: --release -i python --out dist --features gpu
+            maturin-args: --release -i python --out dist --features python-extension,gpu
           - os: macos-15-intel
             suffix: macos-intel
-            maturin-args: --release -i python --out dist --features gpu --features blas-accelerate
+            maturin-args: --release -i python --out dist --features python-extension,gpu,blas-accelerate
           - os: macos-latest
             suffix: macos-arm
-            maturin-args: --release -i python --out dist --features gpu --features blas-accelerate
+            maturin-args: --release -i python --out dist --features python-extension,gpu,blas-accelerate
           - os: windows-latest
             suffix: windows
-            maturin-args: --release -i python --out dist --features gpu
+            maturin-args: --release -i python --out dist --features python-extension,gpu
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
