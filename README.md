@@ -2,13 +2,13 @@
 
 [PyPI](https://pypi.org/project/nndex/) | [Crates.io](https://crates.io/crates/nndex)
 
-A high-performance Rust library with Python bindings for nearest-neighbor vector search with zero configuration necessary that's so fast, it's faster than numpy! This crate leverages the computational trick where if the source vectors and query vectors are all unit-normalized, performing a dot-product — an operation faster than vector distance calculations — returns the cosine similarity.
+A high-performance Rust library with Python bindings for nearest-neighbor vector search with zero configuration necessary that's so fast, it's faster than [numpy](https://numpy.org)! This crate leverages the computational trick where if the source vectors and query vectors are all unit-normalized, performing a dot-product — an operation faster than vector distance calculations — returns the cosine similarity.
 
 Features:
 
 - CPU backend using [rayon](https://crates.io/crates/rayon) parallelism + SIMD (via [simsimd](https://crates.io/crates/simsimd)), along with highly bespoke compute profiles for maximum CPU performance
 - GPU backend using [wgpu](https://crates.io/crates/wgpu) compute shaders, supporting Vulkan, Metal, D3D12, and OpenGL graphics APIs
-- Approximate nearest-neighbor (ANN) mode with exact reranking
+- Approximate nearest-neighbor (ANN) mode with exact reranking by building an IVF index for even faster lookups
 - Batch search for multiple queries at once
 - Python bindings via PyO3 with [numpy](https://numpy.org), [pandas](https://pandas.pydata.org), and [polars](https://pola.rs) support
 - Load embeddings directly from `.npy`, `.npz`, and `.parquet` files
@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nndex = "0.1.0"
+nndex = "0.2.0"
 ```
 
 ## Python Usage
@@ -182,13 +182,13 @@ fn main() -> Result<(), nndex::NNdexError> {
 
 ## Benchmarks
 
-[IMAGES TO BE ADDED]
+[BENCHMARK IMAGES TO BE ADDED]
 
 ## Notes
 
 - nndex is **NOT** a vector store/database which implies that the vectors can be created/updated/deleted from the matrix, and it is not intending to be. It's intended to be used with a fixed matrix of data, although this crate is so fast that you could reinitialize the `NNdex` without much overhead if needed.
-- The approximate mode samples a subset of dimensions (up to 64) for a fast prefilter pass, then reranks the top candidates with exact full-dimensional dot products. For maximum computational efficiency, it only activates when the dimension reduction ratio is >= 3x as otherwise the overhead offsets the benefits of ANN.
 - For Apple Silicon in particular, the use of the GPU backend (Metal) is not recommended due to the dispatch overhead of `wgpu` being greater than the inference speed. This is not the case with discrete GPUs.
+- BLAS is only supported for macOS because the underlying BLAS library ([accelerate](https://developer.apple.com/accelerate/)) is included by default. There are tradeoffs for Linux/Windows and I am still determining what to do there.
 
 ## API Reference
 
@@ -201,7 +201,7 @@ fn main() -> Result<(), nndex::NNdexError> {
 | `data`         | array-like | required | 2D numpy array, list, or pandas/polars DataFrame         |
 | `normalized`   | bool       | `False`  | Skip internal normalization if data is already unit-norm |
 | `approx`       | bool       | `False`  | Enable ANN prefiltering with exact reranking             |
-| `backend`      | str        | `"cpu"`  | `"cpu"`, or `"gpu"`                                      |
+| `backend`      | str        | `"cpu"`  | `"cpu"` or `"gpu"`                                       |
 | `enable_cache` | bool       | `True`   | Cache repeated query results                             |
 
 #### `NNdex.from_file(path, ...)`
@@ -212,7 +212,7 @@ fn main() -> Result<(), nndex::NNdexError> {
 | `key`          | str/None | `None`   | Array key (`.npz`) or column name (`.parquet`)           |
 | `normalized`   | bool     | `False`  | Skip internal normalization if data is already unit-norm |
 | `approx`       | bool     | `False`  | Enable ANN prefiltering with exact reranking             |
-| `backend`      | str      | `"cpu"`  | `"cpu"`, or `"gpu"`                                      |
+| `backend`      | str      | `"cpu"`  | `"cpu"` or `"gpu"`                                       |
 | `enable_cache` | bool     | `True`   | Cache repeated query results                             |
 
 #### `index.search(query, k=10, dataframe=None)`
