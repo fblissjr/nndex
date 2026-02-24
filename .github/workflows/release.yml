@@ -28,20 +28,25 @@ jobs:
         include:
           - os: ubuntu-latest
             suffix: linux
+            maturin-args: --release -i python --out dist --features gpu
           - os: ubuntu-24.04-arm
             suffix: linux-arm64
+            maturin-args: --release -i python --out dist --features gpu
           - os: macos-15-intel
             suffix: macos-intel
+            maturin-args: --release -i python --out dist --features gpu --features blas-accelerate
           - os: macos-latest
             suffix: macos-arm
+            maturin-args: --release -i python --out dist --features gpu --features blas-accelerate
           - os: windows-latest
             suffix: windows
+            maturin-args: --release -i python --out dist --features gpu
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release -i python --out dist
+          args: ${{ matrix.maturin-args }}
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.suffix }}

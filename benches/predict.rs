@@ -6,56 +6,34 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nndex::{BackendPreference, IndexOptions, NNdex};
 
 use common::{
-    PREDICT_BENCH_SIZES, bench_cache_enabled, criterion_with_runtime_defaults, generate_matrix,
-    generate_queries, should_run_case,
+    PREDICT_BENCH_SIZES, criterion_with_runtime_defaults, generate_matrix, generate_queries,
+    should_run_case,
 };
 
-fn bench_predict_cpu(criterion: &mut criterion::Criterion) {
-    let mut group = criterion.benchmark_group("predict/cpu");
+const QUERY_BANK_ROWS: usize = 64;
+const TOP_K_VALUES: &[usize] = &[1, 10];
+
+fn bench_predict_backend(
+    criterion: &mut criterion::Criterion,
+    group_name: &str,
+    backend: BackendPreference,
+    approx: bool,
+    matrix_seed_salt: u64,
+    query_seed_salt: u64,
+    expect_label: &str,
+) {
+    let mut group = criterion.benchmark_group(group_name);
     for &(rows, dims) in PREDICT_BENCH_SIZES {
         if !should_run_case(rows, dims) {
             continue;
         }
 
-        let matrix = generate_matrix(rows, dims, 0xA11CE + rows as u64 + dims as u64);
-        let query = generate_queries(1, dims, 0xC0FFEE + rows as u64);
-        let index = NNdex::new(
-            &matrix,
-            rows,
+        let matrix = generate_matrix(rows, dims, matrix_seed_salt + rows as u64 + dims as u64);
+        let query_bank = generate_queries(
+            QUERY_BANK_ROWS,
             dims,
-            IndexOptions {
-                normalized: false,
-                approx: false,
-                backend: BackendPreference::Cpu,
-                enable_cache: bench_cache_enabled(),
-            },
-        )
-        .expect("CPU index construction should succeed");
-
-        group.bench_with_input(
-            BenchmarkId::new("rows_dims", format!("{rows}x{dims}")),
-            &dims,
-            |bench, _| {
-                bench.iter(|| {
-                    let result =
-                        index.search(std::hint::black_box(&query), std::hint::black_box(10));
-                    std::hint::black_box(result.expect("CPU search should succeed"));
-                });
-            },
+            query_seed_salt + rows as u64 + dims as u64,
         );
-    }
-    group.finish();
-}
-
-fn bench_predict_cpu_ann(criterion: &mut criterion::Criterion) {
-    let mut group = criterion.benchmark_group("predict_ann/cpu");
-    for &(rows, dims) in PREDICT_BENCH_SIZES {
-        if !should_run_case(rows, dims) {
-            continue;
-        }
-
-        let matrix = generate_matrix(rows, dims, 0xBEEF + rows as u64 + dims as u64);
-        let query_bank = generate_queries(64, dims, 0xD00D + rows as u64 + dims as u64);
         let next_query = AtomicUsize::new(0);
         let index = NNdex::new(
             &matrix,
@@ -63,113 +41,85 @@ fn bench_predict_cpu_ann(criterion: &mut criterion::Criterion) {
             dims,
             IndexOptions {
                 normalized: false,
-                approx: true,
-                backend: BackendPreference::Cpu,
-                enable_cache: bench_cache_enabled(),
+                approx,
+                backend,
+                enable_cache: false,
+                gpu_device_index: None,
             },
         )
-        .expect("CPU ANN index construction should succeed");
+        .expect(expect_label);
 
-        group.bench_with_input(
-            BenchmarkId::new("rows_dims", format!("{rows}x{dims}")),
-            &dims,
-            |bench, _| {
-                bench.iter(|| {
-                    let query_index = next_query.fetch_add(1, Ordering::Relaxed) % 64;
-                    let start = query_index * dims;
-                    let end = start + dims;
-                    let result = index.search(
-                        std::hint::black_box(&query_bank[start..end]),
-                        std::hint::black_box(10),
-                    );
-                    std::hint::black_box(result.expect("CPU ANN search should succeed"));
-                });
-            },
-        );
+        for &top_k in TOP_K_VALUES {
+            group.bench_with_input(
+                BenchmarkId::new("rows_dims_k", format!("{rows}x{dims}/k={top_k}")),
+                &top_k,
+                |bench, top_k| {
+                    bench.iter(|| {
+                        let query_index =
+                            next_query.fetch_add(1, Ordering::Relaxed) % QUERY_BANK_ROWS;
+                        let start = query_index * dims;
+                        let end = start + dims;
+                        let result = index.search(
+                            std::hint::black_box(&query_bank[start..end]),
+                            std::hint::black_box(*top_k),
+                        );
+                        std::hint::black_box(result.expect(expect_label));
+                    });
+                },
+            );
+        }
     }
     group.finish();
+}
+
+fn bench_predict_cpu(criterion: &mut criterion::Criterion) {
+    bench_predict_backend(
+        criterion,
+        "predict/cpu",
+        BackendPreference::Cpu,
+        false,
+        0xA11CE,
+        0xC0FFEE,
+        "CPU search should succeed",
+    );
+}
+
+fn bench_predict_cpu_ann(criterion: &mut criterion::Criterion) {
+    bench_predict_backend(
+        criterion,
+        "predict_ann/cpu",
+        BackendPreference::Cpu,
+        true,
+        0xA11CE,
+        0xC0FFEE,
+        "CPU ANN search should succeed",
+    );
 }
 
 #[cfg(feature = "gpu")]
 fn bench_predict_gpu(criterion: &mut criterion::Criterion) {
-    let mut group = criterion.benchmark_group("predict/gpu");
-    for &(rows, dims) in PREDICT_BENCH_SIZES {
-        if !should_run_case(rows, dims) {
-            continue;
-        }
-
-        let matrix = generate_matrix(rows, dims, 0xBADC0DE + rows as u64 + dims as u64);
-        let query = generate_queries(1, dims, 0xDEADBEEF + rows as u64);
-        let index = NNdex::new(
-            &matrix,
-            rows,
-            dims,
-            IndexOptions {
-                normalized: false,
-                approx: false,
-                backend: BackendPreference::Gpu,
-                enable_cache: bench_cache_enabled(),
-            },
-        )
-        .expect("GPU index construction should succeed");
-
-        group.bench_with_input(
-            BenchmarkId::new("rows_dims", format!("{rows}x{dims}")),
-            &dims,
-            |bench, _| {
-                bench.iter(|| {
-                    let result =
-                        index.search(std::hint::black_box(&query), std::hint::black_box(10));
-                    std::hint::black_box(result.expect("GPU search should succeed"));
-                });
-            },
-        );
-    }
-    group.finish();
+    bench_predict_backend(
+        criterion,
+        "predict/gpu",
+        BackendPreference::Gpu,
+        false,
+        0xBADC0DE,
+        0xDEADBEEF,
+        "GPU search should succeed",
+    );
 }
 
 #[cfg(feature = "gpu")]
 fn bench_predict_gpu_ann(criterion: &mut criterion::Criterion) {
-    let mut group = criterion.benchmark_group("predict_ann/gpu");
-    for &(rows, dims) in PREDICT_BENCH_SIZES {
-        if !should_run_case(rows, dims) {
-            continue;
-        }
-
-        let matrix = generate_matrix(rows, dims, 0x1CEB00DA + rows as u64 + dims as u64);
-        let query_bank = generate_queries(64, dims, 0x1CEDFACE + rows as u64 + dims as u64);
-        let next_query = AtomicUsize::new(0);
-        let index = NNdex::new(
-            &matrix,
-            rows,
-            dims,
-            IndexOptions {
-                normalized: false,
-                approx: true,
-                backend: BackendPreference::Gpu,
-                enable_cache: bench_cache_enabled(),
-            },
-        )
-        .expect("GPU ANN index construction should succeed");
-
-        group.bench_with_input(
-            BenchmarkId::new("rows_dims", format!("{rows}x{dims}")),
-            &dims,
-            |bench, _| {
-                bench.iter(|| {
-                    let query_index = next_query.fetch_add(1, Ordering::Relaxed) % 64;
-                    let start = query_index * dims;
-                    let end = start + dims;
-                    let result = index.search(
-                        std::hint::black_box(&query_bank[start..end]),
-                        std::hint::black_box(10),
-                    );
-                    std::hint::black_box(result.expect("GPU ANN search should succeed"));
-                });
-            },
-        );
-    }
-    group.finish();
+    bench_predict_backend(
+        criterion,
+        "predict_ann/gpu",
+        BackendPreference::Gpu,
+        true,
+        0xBADC0DE,
+        0xDEADBEEF,
+        "GPU ANN search should succeed",
+    );
 }
 
 fn criterion_benches(criterion: &mut Criterion) {

@@ -6,6 +6,10 @@
 //! similarity. By default, both stored rows and incoming queries are unit-normalized so cosine
 //! similarity reduces to a dot product.
 
+// Link macOS Accelerate framework for BLAS-backed GEMM (no Rust items, only linker symbols).
+#[cfg(feature = "blas-accelerate")]
+extern crate accelerate_src;
+
 mod approx;
 mod profiles;
 mod topk;
@@ -23,10 +27,12 @@ mod python_io;
 use cpu::CpuIndex;
 #[cfg(feature = "gpu")]
 use gpu::GpuIndex;
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuDeviceInfo, list_gpu_devices};
 #[cfg(feature = "cpu")]
 use rayon::prelude::*;
 #[cfg(any(feature = "cpu", feature = "gpu"))]
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(any(feature = "cpu", feature = "gpu"))]
 use std::hash::{Hash, Hasher};
 #[cfg(any(feature = "cpu", feature = "gpu"))]
@@ -38,8 +44,6 @@ pub use topk::Neighbor;
 /// Preferred backend selection strategy for index execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendPreference {
-    /// Select GPU when available and fall back to CPU if GPU initialization fails.
-    Auto,
     /// Force CPU execution.
     Cpu,
     /// Force GPU execution.
@@ -65,8 +69,11 @@ pub struct IndexOptions {
     /// Backend preference used when constructing the index.
     pub backend: BackendPreference,
     /// If `false`, disables internal query-result caching so every search performs a fresh
-    /// computation. Useful for accurate benchmarking where caching would distort timings.
+    /// computation.
     pub enable_cache: bool,
+    /// Explicit GPU adapter index from [`list_gpu_devices`]. When `None`, automatic selection
+    /// with discrete-GPU preference is used. Ignored when the CPU backend is active.
+    pub gpu_device_index: Option<usize>,
 }
 
 impl Default for IndexOptions {
@@ -74,12 +81,9 @@ impl Default for IndexOptions {
         Self {
             normalized: false,
             approx: false,
-            backend: if cfg!(feature = "gpu") {
-                BackendPreference::Auto
-            } else {
-                BackendPreference::Cpu
-            },
+            backend: BackendPreference::Cpu,
             enable_cache: true,
+            gpu_device_index: None,
         }
     }
 }
@@ -88,19 +92,13 @@ impl IndexOptions {
     #[cfg(feature = "cpu")]
     #[inline]
     fn should_try_cpu_constructor_cache(self) -> bool {
-        self.enable_cache
-            && (matches!(self.backend, BackendPreference::Cpu)
-                || (matches!(self.backend, BackendPreference::Auto) && !cfg!(feature = "gpu")))
+        self.enable_cache && matches!(self.backend, BackendPreference::Cpu)
     }
 
     #[cfg(feature = "gpu")]
     #[inline]
     fn should_try_gpu_constructor_cache(self) -> bool {
-        self.enable_cache
-            && matches!(
-                self.backend,
-                BackendPreference::Gpu | BackendPreference::Auto
-            )
+        self.enable_cache && matches!(self.backend, BackendPreference::Gpu)
     }
 }
 
@@ -268,42 +266,6 @@ impl NNdex {
                     return Err(NNdexError::GpuBackendUnavailable);
                 }
             }
-            BackendPreference::Auto => {
-                #[cfg(feature = "gpu")]
-                {
-                    match build_gpu_backend(&storage, rows, padded_dims, options, gpu_cache_key) {
-                        Ok(gpu_backend) => gpu_backend,
-                        Err(_) => {
-                            #[cfg(feature = "cpu")]
-                            {
-                                build_cpu_backend(
-                                    storage,
-                                    rows,
-                                    padded_dims,
-                                    options,
-                                    cpu_cache_key,
-                                )
-                            }
-                            #[cfg(not(feature = "cpu"))]
-                            {
-                                return Err(NNdexError::GpuBackendUnavailable);
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(feature = "gpu"))]
-                {
-                    #[cfg(feature = "cpu")]
-                    {
-                        build_cpu_backend(storage, rows, padded_dims, options, cpu_cache_key)
-                    }
-                    #[cfg(not(feature = "cpu"))]
-                    {
-                        let _ = (storage, rows, dims);
-                        return Err(NNdexError::CpuBackendUnavailable);
-                    }
-                }
-            }
         };
 
         Ok(Self::with_backend(
@@ -333,6 +295,26 @@ impl NNdex {
     /// Number of dimensions per row.
     pub fn dims(&self) -> usize {
         self.dims
+    }
+
+    /// Returns information about the GPU adapter in use, or `None` when the CPU backend is active.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_info(&self) -> Option<GpuDeviceInfo> {
+        match &self.backend {
+            BackendImpl::Gpu(gpu) => {
+                let info = gpu.adapter_info();
+                Some(GpuDeviceInfo {
+                    index: 0,
+                    name: info.name.clone(),
+                    driver: info.driver.clone(),
+                    driver_info: info.driver_info.clone(),
+                    backend: format!("{:?}", info.backend),
+                    device_type: format!("{:?}", info.device_type),
+                })
+            }
+            #[cfg(feature = "cpu")]
+            BackendImpl::Cpu(_) => None,
+        }
     }
 
     /// Find the top-k nearest neighbors for one query vector.
@@ -616,6 +598,70 @@ fn pad_vector(values: &[f32], padded_dims: usize) -> Vec<f32> {
     out
 }
 
+#[cfg(any(feature = "cpu", feature = "gpu"))]
+const CONSTRUCTOR_CACHE_CAPACITY: usize = 64;
+
+/// Fixed-capacity LRU cache used by constructor-level index reuse.
+#[cfg(any(feature = "cpu", feature = "gpu"))]
+#[derive(Debug)]
+struct BoundedConstructorCache<K, V> {
+    entries: HashMap<K, Arc<V>>,
+    order: VecDeque<K>,
+    capacity: usize,
+}
+
+#[cfg(any(feature = "cpu", feature = "gpu"))]
+impl<K, V> BoundedConstructorCache<K, V>
+where
+    K: Copy + Eq + Hash,
+{
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<Arc<V>> {
+        let value = self.entries.get(key).cloned()?;
+        self.promote(*key);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: Arc<V>) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        if let std::collections::hash_map::Entry::Occupied(mut occupied) = self.entries.entry(key) {
+            occupied.insert(value);
+            self.promote(key);
+            return;
+        }
+
+        if self.entries.len() >= self.capacity
+            && let Some(lru_key) = self.order.pop_front()
+        {
+            self.entries.remove(&lru_key);
+        }
+        self.entries.insert(key, value);
+        self.order.push_back(key);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn promote(&mut self, key: K) {
+        if let Some(index) = self.order.iter().position(|existing| *existing == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key);
+    }
+}
+
 /// Identity key for the CPU constructor cache, combining pointer, shape, and a sampled fingerprint.
 #[cfg(feature = "cpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -629,15 +675,19 @@ struct CpuCacheKey {
 }
 
 #[cfg(feature = "cpu")]
-fn cpu_index_cache() -> &'static Mutex<HashMap<CpuCacheKey, Arc<CpuIndex>>> {
-    static CACHE: OnceLock<Mutex<HashMap<CpuCacheKey, Arc<CpuIndex>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn cpu_index_cache() -> &'static Mutex<BoundedConstructorCache<CpuCacheKey, CpuIndex>> {
+    static CACHE: OnceLock<Mutex<BoundedConstructorCache<CpuCacheKey, CpuIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(BoundedConstructorCache::with_capacity(
+            CONSTRUCTOR_CACHE_CAPACITY,
+        ))
+    })
 }
 
 #[cfg(feature = "cpu")]
 fn get_cached_cpu_index(key: CpuCacheKey) -> Option<Arc<CpuIndex>> {
-    let lock = cpu_index_cache().lock().ok()?;
-    lock.get(&key).cloned()
+    let mut lock = cpu_index_cache().lock().ok()?;
+    lock.get(&key)
 }
 
 #[cfg(feature = "cpu")]
@@ -660,15 +710,19 @@ struct GpuCacheKey {
 }
 
 #[cfg(feature = "gpu")]
-fn gpu_index_cache() -> &'static Mutex<HashMap<GpuCacheKey, Arc<GpuIndex>>> {
-    static CACHE: OnceLock<Mutex<HashMap<GpuCacheKey, Arc<GpuIndex>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn gpu_index_cache() -> &'static Mutex<BoundedConstructorCache<GpuCacheKey, GpuIndex>> {
+    static CACHE: OnceLock<Mutex<BoundedConstructorCache<GpuCacheKey, GpuIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(BoundedConstructorCache::with_capacity(
+            CONSTRUCTOR_CACHE_CAPACITY,
+        ))
+    })
 }
 
 #[cfg(feature = "gpu")]
 fn get_cached_gpu_index(key: GpuCacheKey) -> Option<Arc<GpuIndex>> {
-    let lock = gpu_index_cache().lock().ok()?;
-    lock.get(&key).cloned()
+    let mut lock = gpu_index_cache().lock().ok()?;
+    lock.get(&key)
 }
 
 #[cfg(feature = "gpu")]
@@ -676,6 +730,17 @@ fn cache_gpu_index(key: GpuCacheKey, index: &Arc<GpuIndex>) {
     if let Ok(mut lock) = gpu_index_cache().lock() {
         lock.insert(key, Arc::clone(index));
     }
+}
+
+#[cfg(all(test, feature = "cpu"))]
+fn cpu_constructor_cache_len() -> Option<usize> {
+    let lock = cpu_index_cache().lock().ok()?;
+    Some(lock.len())
+}
+
+#[cfg(all(test, feature = "cpu"))]
+fn constructor_cache_capacity() -> usize {
+    CONSTRUCTOR_CACHE_CAPACITY
 }
 
 /// Compute a cheap hash fingerprint over sampled matrix elements for cache invalidation.
@@ -737,6 +802,7 @@ fn build_gpu_backend(
         padded_dims,
         options.approx,
         options.enable_cache,
+        options.gpu_device_index,
     )?);
     if options.enable_cache {
         cache_gpu_index(cache_key, &gpu);
@@ -965,6 +1031,7 @@ mod tests {
             approx: false,
             backend: BackendPreference::Cpu,
             enable_cache: true,
+            gpu_device_index: None,
         };
 
         let first = NNdex::new(&matrix, rows, dims, options)
@@ -996,6 +1063,40 @@ mod tests {
             .search(&query, 5)
             .expect("second search should succeed");
         assert_eq!(first_result, second_result);
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn cpu_constructor_cache_is_bounded() {
+        let rows = 1usize;
+        let dims = 8usize;
+        let options = IndexOptions {
+            normalized: false,
+            approx: false,
+            backend: BackendPreference::Cpu,
+            enable_cache: true,
+            gpu_device_index: None,
+        };
+        let case_count = constructor_cache_capacity() * 4;
+
+        let matrices: Vec<Vec<f32>> = (0..case_count)
+            .map(|i| {
+                let base = (i as f32) * 0.001 + 1.0;
+                vec![base; rows * dims]
+            })
+            .collect();
+
+        for matrix in &matrices {
+            let _ =
+                NNdex::new(matrix, rows, dims, options).expect("index construction should succeed");
+        }
+
+        let cache_len = cpu_constructor_cache_len().expect("cache lock should succeed");
+        assert!(
+            cache_len <= constructor_cache_capacity(),
+            "constructor cache grew beyond cap: {cache_len} > {}",
+            constructor_cache_capacity()
+        );
     }
 
     // ---- Error path tests ----
@@ -1184,5 +1285,59 @@ mod tests {
         let query = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let result = index.search(&query, 100).expect("query should succeed");
         assert_eq!(result.len(), 2);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_info_returns_none_for_cpu_backend() {
+        let matrix = vec![1.0_f32; 16];
+        let index = NNdex::new(
+            &matrix,
+            2,
+            8,
+            IndexOptions {
+                backend: BackendPreference::Cpu,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("index construction should succeed");
+        assert!(index.gpu_info().is_none());
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn list_gpu_devices_returns_without_panic() {
+        let devices = list_gpu_devices();
+        for device in &devices {
+            assert!(!device.name.is_empty() || device.name.is_empty());
+            assert_eq!(device.index, device.index);
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn list_gpu_devices_fields_populated_when_present() {
+        let devices = list_gpu_devices();
+        for device in &devices {
+            assert!(!device.backend.is_empty());
+            assert!(!device.device_type.is_empty());
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn invalid_gpu_device_index_returns_error() {
+        let matrix = vec![1.0_f32; 16];
+        let result = NNdex::new(
+            &matrix,
+            2,
+            8,
+            IndexOptions {
+                backend: BackendPreference::Gpu,
+                gpu_device_index: Some(9999),
+                ..IndexOptions::default()
+            },
+        );
+        assert!(result.is_err());
     }
 }

@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nndex::{BackendPreference, IndexOptions, NNdex};
 
-use common::{
-    bench_cache_enabled, criterion_with_runtime_defaults, generate_matrix, generate_queries,
-};
+use common::{criterion_with_runtime_defaults, generate_matrix, generate_queries};
 
 const MATRIX_ROWS: usize = 10_000_000;
 const MATRIX_DIMS: usize = 24;
@@ -48,7 +46,8 @@ fn bench_batch_cpu(criterion: &mut criterion::Criterion) {
             normalized: false,
             approx: false,
             backend: BackendPreference::Cpu,
-            enable_cache: bench_cache_enabled(),
+            enable_cache: false,
+            gpu_device_index: None,
         },
     )
     .expect("CPU index construction should succeed");
@@ -85,7 +84,8 @@ fn bench_batch_cpu_ann(criterion: &mut criterion::Criterion) {
             normalized: false,
             approx: true,
             backend: BackendPreference::Cpu,
-            enable_cache: bench_cache_enabled(),
+            enable_cache: false,
+            gpu_device_index: None,
         },
     )
     .expect("CPU ANN index construction should succeed");
@@ -132,7 +132,8 @@ fn bench_batch_gpu(criterion: &mut criterion::Criterion) {
             normalized: false,
             approx: false,
             backend: BackendPreference::Gpu,
-            enable_cache: bench_cache_enabled(),
+            enable_cache: false,
+            gpu_device_index: None,
         },
     )
     .expect("GPU index construction should succeed");
@@ -170,7 +171,8 @@ fn bench_batch_gpu_ann(criterion: &mut criterion::Criterion) {
             normalized: false,
             approx: true,
             backend: BackendPreference::Gpu,
-            enable_cache: bench_cache_enabled(),
+            enable_cache: false,
+            gpu_device_index: None,
         },
     )
     .expect("GPU ANN index construction should succeed");
@@ -205,11 +207,59 @@ fn bench_batch_gpu_ann(criterion: &mut criterion::Criterion) {
     group.finish();
 }
 
+/// High-dimensional batch shapes that exercise the GEMM code path (dims >= 64).
+/// Mirrors the notebook scenarios where BLAS-backed matrix multiply matters most.
+const GEMM_BATCH_SIZES: &[(usize, usize, usize)] = &[
+    // (rows, dims, query_rows)
+    (10_000, 128, 128),
+    (15_555, 192, 128),
+    (18_181, 640, 96),
+    (10_000, 768, 64),
+];
+
+fn bench_batch_gemm_cpu(criterion: &mut criterion::Criterion) {
+    let mut group = criterion.benchmark_group("batch_gemm/cpu");
+    for &(rows, dims, query_rows) in GEMM_BATCH_SIZES {
+        let matrix = generate_matrix(rows, dims, 0x6E44_0000 + rows as u64 + dims as u64);
+        let queries = generate_queries(query_rows, dims, 0x6E44_FFFF + rows as u64 + dims as u64);
+        let index = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                normalized: false,
+                approx: false,
+                backend: BackendPreference::Cpu,
+                enable_cache: false,
+                gpu_device_index: None,
+            },
+        )
+        .expect("CPU GEMM index construction should succeed");
+
+        group.bench_with_input(
+            BenchmarkId::new("rows_dims_queries", format!("{rows}x{dims}/q={query_rows}")),
+            &query_rows,
+            |bench, _| {
+                bench.iter(|| {
+                    let result = index.search_batch(
+                        std::hint::black_box(&queries),
+                        std::hint::black_box(query_rows),
+                        std::hint::black_box(15),
+                    );
+                    std::hint::black_box(result.expect("CPU GEMM batch search should succeed"));
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn criterion_benches(criterion: &mut Criterion) {
     let mut configured = criterion_with_runtime_defaults().configure_from_args();
     let _ = criterion;
     bench_batch_cpu(&mut configured);
     bench_batch_cpu_ann(&mut configured);
+    bench_batch_gemm_cpu(&mut configured);
     #[cfg(feature = "gpu")]
     {
         bench_batch_gpu(&mut configured);

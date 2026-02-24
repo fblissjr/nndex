@@ -9,10 +9,7 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 use crate::approx::ApproxIndex;
-use crate::profiles::{
-    CachePolicy, TuningProfile, prefer_gpu_exact_for_batch as should_prefer_gpu_exact_for_batch,
-    should_use_gpu_ann_prefilter,
-};
+use crate::profiles::{CachePolicy, TuningProfile};
 use crate::topk::{Neighbor, TopKAccumulator};
 
 const WORKGROUP_SIZE: u32 = 256;
@@ -45,6 +42,14 @@ pub enum GpuError {
     /// The output buffer could not be mapped back to the CPU for reading.
     #[error("failed to map GPU buffer for reading")]
     MapReadFailed,
+    /// The requested GPU device index is out of range.
+    #[error("gpu device index {index} is out of range (found {count} adapter(s))")]
+    DeviceIndexOutOfRange {
+        /// Requested index.
+        index: usize,
+        /// Number of available adapters.
+        count: usize,
+    },
 }
 
 /// Shader uniform parameters matching the WGSL `Params` struct layout.
@@ -90,6 +95,7 @@ struct SingleQueryDispatch {
 pub(crate) struct GpuIndex {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    adapter_info: wgpu::AdapterInfo,
     rows: usize,
     dims: usize,
     /// dims rounded up to multiple of 4 for vec4 shader access.
@@ -108,7 +114,7 @@ pub(crate) struct GpuIndex {
     /// Max queries that fit in one sub-batch before output buffer exceeds adapter limits.
     max_queries_per_sub_batch: usize,
     /// Reusable buffers for single-query exact GPU dispatch.
-    single_query_dispatch: Option<Mutex<SingleQueryDispatch>>,
+    single_query_dispatch: Option<OnceLock<Mutex<SingleQueryDispatch>>>,
 }
 
 impl GpuIndex {
@@ -121,10 +127,13 @@ impl GpuIndex {
     /// * `dims` - Number of dimensions per row (already padded to multiple of 8).
     /// * `approx` - Whether to build the ANN prefilter index.
     /// * `enable_cache` - Whether to enable query-result caching.
+    /// * `gpu_device_index` - Explicit adapter index from [`list_gpu_devices`], or `None` for
+    ///   automatic selection preferring discrete GPUs.
     ///
     /// # Errors
     ///
     /// Returns [`GpuError::AdapterNotFound`] if no GPU is available.
+    /// Returns [`GpuError::DeviceIndexOutOfRange`] if `gpu_device_index` is invalid.
     /// Returns [`GpuError::RequestDevice`] on device creation failure.
     pub(crate) fn new(
         matrix: &[f32],
@@ -132,15 +141,12 @@ impl GpuIndex {
         dims: usize,
         approx: bool,
         enable_cache: bool,
+        gpu_device_index: Option<usize>,
     ) -> Result<Self, GpuError> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .map_err(|_| GpuError::AdapterNotFound)?;
+        let adapter = select_adapter(&instance, gpu_device_index)?;
 
+        let adapter_info = adapter.get_info();
         let requested_limits = adapter.limits();
         let max_buffer_binding_size = adapter.limits().max_storage_buffer_binding_size as usize;
 
@@ -238,7 +244,13 @@ impl GpuIndex {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        let padded_matrix = pad_to_vec4(matrix, rows, dims, dims_vec4);
+        // Avoid duplicating host memory when rows are already vec4-aligned.
+        // This reduces fit-time allocation and copy overhead for common dimensions.
+        let padded_matrix = if dims == dims_vec4 {
+            Cow::Borrowed(matrix)
+        } else {
+            Cow::Owned(pad_to_vec4(matrix, rows, dims, dims_vec4))
+        };
 
         let max_binding_bytes =
             max_buffer_binding_size.max(dims_vec4.saturating_mul(std::mem::size_of::<f32>()));
@@ -268,18 +280,12 @@ impl GpuIndex {
         let max_chunk_rows = chunks.iter().map(|c| c.row_count).max().unwrap_or(1);
         let bytes_per_query = max_chunk_rows * std::mem::size_of::<f32>();
         let max_queries_per_sub_batch = (max_buffer_binding_size / bytes_per_query).max(1);
-        let single_query_dispatch = (rows <= SINGLE_QUERY_REUSE_MAX_ROWS).then(|| {
-            Mutex::new(build_single_query_dispatch(
-                &device,
-                &bind_group_layout,
-                &chunks,
-                dims_vec4,
-            ))
-        });
+        let single_query_dispatch = (rows <= SINGLE_QUERY_REUSE_MAX_ROWS).then(OnceLock::new);
 
         Ok(Self {
             device,
             queue,
+            adapter_info,
             rows,
             dims,
             dims_vec4,
@@ -300,6 +306,11 @@ impl GpuIndex {
             max_queries_per_sub_batch,
             single_query_dispatch,
         })
+    }
+
+    /// Returns the adapter info captured at construction time.
+    pub(crate) fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
     }
 
     /// Search for the top-k nearest neighbors of a single query.
@@ -338,16 +349,16 @@ impl GpuIndex {
     }
 
     /// Route a single query through CPU-side ANN prefilter or GPU exact dispatch.
+    ///
+    /// CPU-side ANN is only used when the matrix requires enough GPU chunks that
+    /// dispatch overhead exceeds the cost of a CPU prefilter scan.
     fn dispatch_single_or_approx(
         &self,
         query: &[f32],
         k: usize,
         approx: bool,
     ) -> Result<Vec<Neighbor>, GpuError> {
-        if approx
-            && should_use_gpu_ann_prefilter(self.rows, self.dims)
-            && let Some(approx_index) = self.approx_index()
-        {
+        if approx && let Some(approx_index) = self.approx_index() {
             return Ok(self.search_approx_cpu(query, k, approx_index));
         }
         self.search_exact_single(query, k)
@@ -396,11 +407,7 @@ impl GpuIndex {
         approx: bool,
     ) -> Result<Vec<Vec<Neighbor>>, GpuError> {
         let capped_k = k.min(self.rows);
-        if approx
-            && should_use_gpu_ann_prefilter(self.rows, self.dims)
-            && !self.prefer_gpu_exact_for_batch(query_rows)
-            && let Some(approx_index) = self.approx_index()
-        {
+        if approx && let Some(approx_index) = self.approx_index() {
             #[cfg(feature = "cpu")]
             {
                 use rayon::prelude::*;
@@ -454,21 +461,6 @@ impl GpuIndex {
         accumulator.into_sorted_vec()
     }
 
-    /// Check whether GPU exact dispatch would be faster than CPU-side ANN for
-    /// a batch of `query_count` queries.
-    ///
-    /// GPU exact is preferred when the total number of sub-batch dispatches is
-    /// small enough that dispatch + readback overhead stays below the cost of
-    /// CPU-side ANN candidate search.
-    #[inline]
-    fn prefer_gpu_exact_for_batch(&self, query_count: usize) -> bool {
-        should_prefer_gpu_exact_for_batch(
-            query_count,
-            self.max_queries_per_sub_batch,
-            self.chunks.len(),
-        )
-    }
-
     /// Select the appropriate pipeline based on dimensionality.
     #[inline]
     fn select_pipeline(&self) -> &wgpu::ComputePipeline {
@@ -498,7 +490,15 @@ impl GpuIndex {
             Cow::Owned(pad_query_vec4(query, self.dims, self.dims_vec4))
         };
         if let Some(reused_dispatch) = &self.single_query_dispatch {
-            return self.dispatch_single_reused(padded_query.as_ref(), k, reused_dispatch);
+            let dispatch = reused_dispatch.get_or_init(|| {
+                Mutex::new(build_single_query_dispatch(
+                    &self.device,
+                    &self.bind_group_layout,
+                    &self.chunks,
+                    self.dims_vec4,
+                ))
+            });
+            return self.dispatch_single_reused(padded_query.as_ref(), k, dispatch);
         }
         let results = self.dispatch_batched(padded_query.as_ref(), 1, k)?;
         Ok(results.into_iter().next().unwrap_or_default())
@@ -895,4 +895,93 @@ fn pad_query_vec4(query: &[f32], dims: usize, padded_dims: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; padded_dims];
     out[..dims].copy_from_slice(&query[..dims]);
     out
+}
+
+/// Select a wgpu adapter, either by explicit index or with automatic discrete-GPU preference.
+///
+/// When `gpu_device_index` is `Some(idx)`, the adapter at that position in the enumeration
+/// list is returned. When `None`, `request_adapter` with `HighPerformance` is tried first;
+/// if the result is an integrated GPU, all adapters are scanned for a discrete GPU.
+///
+/// # Errors
+///
+/// Returns [`GpuError::AdapterNotFound`] if no adapter is available.
+/// Returns [`GpuError::DeviceIndexOutOfRange`] if the explicit index is out of range.
+fn select_adapter(
+    instance: &wgpu::Instance,
+    gpu_device_index: Option<usize>,
+) -> Result<wgpu::Adapter, GpuError> {
+    if let Some(idx) = gpu_device_index {
+        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        if idx >= adapters.len() {
+            return Err(GpuError::DeviceIndexOutOfRange {
+                index: idx,
+                count: adapters.len(),
+            });
+        }
+        return Ok(adapters
+            .into_iter()
+            .nth(idx)
+            .expect("index validated above"));
+    }
+
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .map_err(|_| GpuError::AdapterNotFound)?;
+
+    // If the default pick is an integrated GPU, scan for a discrete one.
+    if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
+        let all = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        if let Some(discrete) = all
+            .into_iter()
+            .find(|a: &wgpu::Adapter| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+        {
+            return Ok(discrete);
+        }
+    }
+
+    Ok(adapter)
+}
+
+/// Information about a discovered GPU adapter, suitable for display and device selection.
+#[derive(Debug, Clone)]
+pub struct GpuDeviceInfo {
+    /// Enumeration index, pass to [`IndexOptions::gpu_device_index`] to select this adapter.
+    pub index: usize,
+    /// Human-readable adapter name.
+    pub name: String,
+    /// Driver name reported by the adapter.
+    pub driver: String,
+    /// Additional driver information (e.g. version string).
+    pub driver_info: String,
+    /// Rendering backend (e.g. "Vulkan", "Metal", "Dx12").
+    pub backend: String,
+    /// Device type (e.g. "DiscreteGpu", "IntegratedGpu", "Cpu").
+    pub device_type: String,
+}
+
+/// Enumerate all available GPU adapters and return their info.
+///
+/// Returns an empty `Vec` when no adapters are found (e.g. headless CI without a GPU).
+pub fn list_gpu_devices() -> Vec<GpuDeviceInfo> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    adapters
+        .into_iter()
+        .enumerate()
+        .map(|(index, adapter)| {
+            let info = adapter.get_info();
+            GpuDeviceInfo {
+                index,
+                name: info.name,
+                driver: info.driver,
+                driver_info: info.driver_info,
+                backend: format!("{:?}", info.backend),
+                device_type: format!("{:?}", info.device_type),
+            }
+        })
+        .collect()
 }

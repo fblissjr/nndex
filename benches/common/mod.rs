@@ -68,12 +68,6 @@ pub fn should_run_case(rows: usize, dims: usize) -> bool {
     rows.saturating_mul(dims) <= 50_000_000
 }
 
-/// Returns `false` when `NNDEX_BENCH_NOCACHE=1` is set, signalling that
-/// internal query-result caches should be disabled for accurate benchmarking.
-pub fn bench_cache_enabled() -> bool {
-    !benchmark_flag("NNDEX_BENCH_NOCACHE", "FASTDOT_BENCH_NOCACHE")
-}
-
 fn benchmark_flag(primary: &str, legacy: &str) -> bool {
     [primary, legacy]
         .into_iter()

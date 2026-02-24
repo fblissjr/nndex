@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
+try:
+    import simsimd
+except ImportError:  # pragma: no cover - optional benchmarking dependency
+    simsimd = None
 
 from nndex import NNdex
 
@@ -12,6 +16,7 @@ from python_benchmarks.common import (
     generate_query,
     repeats_for_case,
     should_run_case,
+    topk_from_scores,
 )
 
 
@@ -26,9 +31,23 @@ def numpy_predict(
 ) -> tuple[np.ndarray, np.ndarray]:
     query_norm = query / max(float(np.linalg.norm(query)), 1e-12)
     scores = matrix_norm @ query_norm
-    top_idx = np.argpartition(scores, -k)[-k:]
-    ordered = top_idx[np.argsort(scores[top_idx])[::-1]]
-    return ordered, scores[ordered]
+    return topk_from_scores(scores, k)
+
+
+def simsimd_predict(
+    matrix_norm: np.ndarray,
+    query: np.ndarray,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if simsimd is None:
+        raise RuntimeError("simsimd is not installed")
+    query_norm = query / max(float(np.linalg.norm(query)), 1e-12)
+    distances = np.asarray(
+        simsimd.cdist(matrix_norm, query_norm.reshape(1, -1), "cosine"),
+        dtype=np.float32,
+    ).reshape(-1)
+    scores = 1.0 - distances
+    return topk_from_scores(scores, k)
 
 
 def main() -> None:
@@ -41,13 +60,25 @@ def main() -> None:
         query = generate_query(dims, seed=rows + dims * 7)
         repeats = repeats_for_case(rows, dims)
 
-        cpu_model = NNdex(matrix, normalized=False, backend="cpu")
-        cpu_approx_model = NNdex(
-            matrix, normalized=False, approx=True, backend="cpu"
+        cpu_model = NNdex(
+            matrix, normalized=False, backend="cpu", enable_cache=False
         )
-        gpu_model = NNdex(matrix, normalized=False, backend="gpu")
+        cpu_approx_model = NNdex(
+            matrix,
+            normalized=False,
+            approx=True,
+            backend="cpu",
+            enable_cache=False,
+        )
+        gpu_model = NNdex(
+            matrix, normalized=False, backend="gpu", enable_cache=False
+        )
         gpu_approx_model = NNdex(
-            matrix, normalized=False, approx=True, backend="gpu"
+            matrix,
+            normalized=False,
+            approx=True,
+            backend="gpu",
+            enable_cache=False,
         )
         matrix_norm = numpy_prepare(matrix)
 
@@ -73,12 +104,21 @@ def main() -> None:
         numpy_ns = benchmark_ns(
             lambda: numpy_predict(matrix_norm, query, k=10), repeats=repeats
         )
+        simsimd_ns = (
+            benchmark_ns(
+                lambda: simsimd_predict(matrix_norm, query, k=10), repeats=repeats
+            )
+            if simsimd is not None
+            else None
+        )
 
         print(fmt_row("binding_predict_cpu", rows, dims, cpu_ns))
         print(fmt_row("binding_predict_cpu_apx", rows, dims, cpu_approx_ns))
         print(fmt_row("binding_predict_gpu", rows, dims, gpu_ns))
         print(fmt_row("binding_predict_gpu_apx", rows, dims, gpu_approx_ns))
         print(fmt_row("numpy_predict_cpu", rows, dims, numpy_ns))
+        if simsimd_ns is not None:
+            print(fmt_row("simsimd_predict_cpu", rows, dims, simsimd_ns))
         print()
 
 

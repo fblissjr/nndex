@@ -44,6 +44,7 @@ impl PartialOrd for HeapItem {
 pub(crate) struct TopKAccumulator {
     k: usize,
     heap: BinaryHeap<Reverse<HeapItem>>,
+    best_item: Option<HeapItem>,
     /// Cached minimum similarity in the heap for O(1) fast-reject.
     min_threshold: f32,
 }
@@ -53,7 +54,8 @@ impl TopKAccumulator {
     pub(crate) fn new(k: usize) -> Self {
         Self {
             k,
-            heap: BinaryHeap::with_capacity(k.saturating_add(1)),
+            heap: BinaryHeap::with_capacity(if k > 1 { k.saturating_add(1) } else { 0 }),
+            best_item: None,
             min_threshold: f32::NEG_INFINITY,
         }
     }
@@ -61,6 +63,23 @@ impl TopKAccumulator {
     /// Consider a candidate neighbor, inserting it only if it belongs in the top-k.
     #[inline]
     pub(crate) fn push(&mut self, index: usize, similarity: f32) {
+        if self.k == 1 {
+            match self.best_item {
+                Some(current_best) => {
+                    if similarity <= current_best.similarity {
+                        return;
+                    }
+                    self.best_item = Some(HeapItem { index, similarity });
+                    self.min_threshold = similarity;
+                }
+                None => {
+                    self.best_item = Some(HeapItem { index, similarity });
+                    self.min_threshold = similarity;
+                }
+            }
+            return;
+        }
+
         if self.heap.len() >= self.k {
             if similarity <= self.min_threshold {
                 return;
@@ -83,6 +102,13 @@ impl TopKAccumulator {
 
     /// Merge all entries from `other` into this accumulator, maintaining the top-k invariant.
     pub(crate) fn merge(&mut self, other: Self) {
+        if self.k == 1 {
+            if let Some(item) = other.best_item {
+                self.push(item.index, item.similarity);
+            }
+            return;
+        }
+
         for item in other.heap {
             self.push(item.0.index, item.0.similarity);
         }
@@ -90,6 +116,18 @@ impl TopKAccumulator {
 
     /// Consume the accumulator and return neighbors sorted by descending similarity.
     pub(crate) fn into_sorted_vec(self) -> Vec<Neighbor> {
+        if self.k == 1 {
+            return self
+                .best_item
+                .map(|item| {
+                    vec![Neighbor {
+                        index: item.index,
+                        similarity: item.similarity,
+                    }]
+                })
+                .unwrap_or_default();
+        }
+
         let mut out = self
             .heap
             .into_iter()
@@ -107,6 +145,53 @@ impl TopKAccumulator {
         out.shrink_to_fit();
         out
     }
+}
+
+/// Extract the top-k neighbors from a dense score array using O(n) introselect.
+///
+/// Faster than the heap-based `TopKAccumulator` for dense score arrays produced
+/// by GEMM, because `select_nth_unstable_by` uses quickselect (O(n) average)
+/// instead of O(n log k) heap insertions.
+///
+/// # Arguments
+///
+/// * `scores` - Dense similarity scores for one query row, length = number of stored rows.
+/// * `k` - Number of top neighbors to return.
+/// * `row_offset` - Offset added to local indices to produce global row indices.
+///
+/// # Returns
+///
+/// Top-k neighbors sorted by descending similarity.
+pub(crate) fn topk_from_scores(scores: &[f32], k: usize, row_offset: usize) -> Vec<Neighbor> {
+    let capped_k = k.min(scores.len());
+    if capped_k == 0 {
+        return Vec::new();
+    }
+
+    // Build (index, score) pairs for partitioning.
+    let mut indexed: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
+
+    // Partition so that the top-k elements are in indexed[..capped_k].
+    // select_nth_unstable_by places the (k-1)th element (by descending score)
+    // at position k-1, with all higher-scoring elements before it.
+    indexed.select_nth_unstable_by(capped_k - 1, |a, b| {
+        b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut result: Vec<Neighbor> = indexed[..capped_k]
+        .iter()
+        .map(|&(idx, sim)| Neighbor {
+            index: idx + row_offset,
+            similarity: sim,
+        })
+        .collect();
+
+    result.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then_with(|| a.index.cmp(&b.index))
+    });
+    result
 }
 
 #[cfg(test)]
@@ -222,6 +307,21 @@ mod tests {
     }
 
     #[test]
+    fn merge_k_equals_one_keeps_best() {
+        let mut left = TopKAccumulator::new(1);
+        left.push(0, 0.3);
+
+        let mut right = TopKAccumulator::new(1);
+        right.push(9, 0.7);
+
+        left.merge(right);
+        let result = left.into_sorted_vec();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].index, 9);
+        assert_eq!(result[0].similarity, 0.7);
+    }
+
+    #[test]
     fn negative_similarities_handled_correctly() {
         let mut acc = TopKAccumulator::new(2);
         acc.push(0, -0.9);
@@ -232,5 +332,50 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].index, 1);
         assert_eq!(result[1].index, 2);
+    }
+
+    // ---- topk_from_scores ----
+
+    #[test]
+    fn topk_from_scores_returns_top_k() {
+        let scores = vec![0.1, 0.9, 0.5, 0.3, 0.7];
+        let result = topk_from_scores(&scores, 3, 0);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].index, 1);
+        assert_eq!(result[1].index, 4);
+        assert_eq!(result[2].index, 2);
+    }
+
+    #[test]
+    fn topk_from_scores_with_row_offset() {
+        let scores = vec![0.1, 0.9, 0.5];
+        let result = topk_from_scores(&scores, 2, 100);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].index, 101);
+        assert_eq!(result[1].index, 102);
+    }
+
+    #[test]
+    fn topk_from_scores_k_larger_than_len() {
+        let scores = vec![0.3, 0.7];
+        let result = topk_from_scores(&scores, 10, 0);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].index, 1);
+        assert_eq!(result[1].index, 0);
+    }
+
+    #[test]
+    fn topk_from_scores_empty() {
+        let result = topk_from_scores(&[], 5, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn topk_from_scores_ties_broken_by_index() {
+        let scores = vec![0.5, 0.5, 0.5];
+        let result = topk_from_scores(&scores, 3, 0);
+        assert_eq!(result[0].index, 0);
+        assert_eq!(result[1].index, 1);
+        assert_eq!(result[2].index, 2);
     }
 }

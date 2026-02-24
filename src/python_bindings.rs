@@ -7,6 +7,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use pyo3::types::{PyAny, PyDict, PyList};
 
+#[cfg(feature = "gpu")]
+use crate::gpu;
 use crate::python_io::load_matrix_from_disk;
 use crate::{ActiveBackend, BackendPreference, IndexOptions, NNdex, Neighbor};
 
@@ -36,7 +38,7 @@ pub struct PyNNdex {
 #[pymethods]
 impl PyNNdex {
     #[new]
-    #[pyo3(signature = (data, normalized=false, approx=false, backend="auto", enable_cache=true))]
+    #[pyo3(signature = (data, normalized=false, approx=false, backend="cpu", enable_cache=true, gpu_device_index=None))]
     fn new(
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
@@ -44,8 +46,10 @@ impl PyNNdex {
         approx: bool,
         backend: &str,
         enable_cache: bool,
+        gpu_device_index: Option<usize>,
     ) -> PyResult<Self> {
-        let index_options = parse_index_options(normalized, approx, backend, enable_cache)?;
+        let index_options =
+            parse_index_options(normalized, approx, backend, enable_cache, gpu_device_index)?;
 
         if let Ok(array) = data.extract::<PyReadonlyArray2<'_, f32>>() {
             let shape = array.shape();
@@ -62,7 +66,8 @@ impl PyNNdex {
     }
 
     #[classmethod]
-    #[pyo3(signature = (path, *, key=None, normalized=false, approx=false, backend="auto", enable_cache=true))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (path, *, key=None, normalized=false, approx=false, backend="cpu", enable_cache=true, gpu_device_index=None))]
     fn from_file(
         _cls: &Bound<'_, PyType>,
         path: &str,
@@ -71,8 +76,10 @@ impl PyNNdex {
         approx: bool,
         backend: &str,
         enable_cache: bool,
+        gpu_device_index: Option<usize>,
     ) -> PyResult<Self> {
-        let index_options = parse_index_options(normalized, approx, backend, enable_cache)?;
+        let index_options =
+            parse_index_options(normalized, approx, backend, enable_cache, gpu_device_index)?;
         let matrix = load_matrix_from_disk(path, key)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         build_index(&matrix.values, matrix.rows, matrix.dims, index_options)
@@ -94,6 +101,25 @@ impl PyNNdex {
     #[getter]
     fn dims(&self) -> usize {
         self.dims
+    }
+
+    /// Returns a dict with GPU adapter info, or `None` when the CPU backend is active.
+    #[getter]
+    fn gpu_info(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        #[cfg(feature = "gpu")]
+        {
+            if let Some(info) = self.index.gpu_info() {
+                let dict = PyDict::new(py);
+                dict.set_item("index", info.index)?;
+                dict.set_item("name", info.name)?;
+                dict.set_item("driver", info.driver)?;
+                dict.set_item("driver_info", info.driver_info)?;
+                dict.set_item("backend", info.backend)?;
+                dict.set_item("device_type", info.device_type)?;
+                return Ok(Some(dict.unbind()));
+            }
+        }
+        Ok(None)
     }
 
     #[pyo3(signature = (query, k=10, dataframe=None))]
@@ -228,6 +254,7 @@ fn parse_index_options(
     approx: bool,
     backend: &str,
     enable_cache: bool,
+    gpu_device_index: Option<usize>,
 ) -> PyResult<IndexOptions> {
     let preference = parse_backend(backend)?;
     Ok(IndexOptions {
@@ -235,23 +262,47 @@ fn parse_index_options(
         approx,
         backend: preference,
         enable_cache,
+        gpu_device_index,
     })
+}
+
+/// List all available GPU adapters as a list of dicts.
+///
+/// Each dict contains: `index`, `name`, `driver`, `driver_info`, `backend`, `device_type`.
+/// Returns an empty list when no GPU is available.
+#[cfg(feature = "gpu")]
+#[pyfunction]
+fn list_gpu_devices(py: Python<'_>) -> PyResult<Py<PyList>> {
+    let devices = gpu::list_gpu_devices();
+    let list = PyList::empty(py);
+    for device in devices {
+        let dict = PyDict::new(py);
+        dict.set_item("index", device.index)?;
+        dict.set_item("name", device.name)?;
+        dict.set_item("driver", device.driver)?;
+        dict.set_item("driver_info", device.driver_info)?;
+        dict.set_item("backend", device.backend)?;
+        dict.set_item("device_type", device.device_type)?;
+        list.append(dict)?;
+    }
+    Ok(list.unbind())
 }
 
 #[pymodule]
 pub fn _nndex(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyNNdex>()?;
+    #[cfg(feature = "gpu")]
+    module.add_function(wrap_pyfunction!(list_gpu_devices, module)?)?;
     Ok(())
 }
 
-/// Map a user-supplied backend string (`"auto"`, `"cpu"`, `"gpu"`) to the enum.
+/// Map a user-supplied backend string (`"cpu"`, `"gpu"`) to the enum.
 fn parse_backend(raw: &str) -> PyResult<BackendPreference> {
     match raw.to_ascii_lowercase().as_str() {
-        "auto" => Ok(BackendPreference::Auto),
         "cpu" => Ok(BackendPreference::Cpu),
         "gpu" => Ok(BackendPreference::Gpu),
         other => Err(PyValueError::new_err(format!(
-            "unsupported backend '{other}', expected one of: auto, cpu, gpu"
+            "unsupported backend '{other}', expected one of: cpu, gpu"
         ))),
     }
 }

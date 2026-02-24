@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "nndex"
-version = "0.1.0"
-description = "Fast cosine similarity with CPU/GPU Rust backends"
+version = "0.2.0"
 authors = [{ name = "Max Woolf", email = "max@minimaxir.com" }]
 readme = "README.md"
 license = { text = "MIT" }
+description = "In-memory nearest neighbor search engine for Python, implemented in Rust."
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
@@ -19,4 +19,5 @@ polars = ["polars>=1.0"]
 [tool.maturin]
 python-source = "python"
 module-name = "nndex._nndex"
-features = ["python-extension"]
+# macOS only: blas-accelerate links Apple Accelerate for faster batch search.
+features = ["python-extension", "blas-accelerate"]

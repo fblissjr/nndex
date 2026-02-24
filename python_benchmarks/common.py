@@ -60,6 +60,12 @@ def fmt_row(name: str, rows: int, dims: int, ns: int) -> str:
     return f"{name:20s} {rows:>10d} {dims:>8d} {ns:>15d} ns {ms:>12.6f} ms"
 
 
+def topk_from_scores(scores: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    top_idx = np.argpartition(scores, -k)[-k:]
+    ordered = top_idx[np.argsort(scores[top_idx])[::-1]]
+    return ordered, scores[ordered]
+
+
 def bench_flag(primary: str, legacy: str) -> bool:
     value = os.environ.get(primary, os.environ.get(legacy, "0"))
     return int(value) == 1

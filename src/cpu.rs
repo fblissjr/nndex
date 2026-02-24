@@ -7,7 +7,7 @@ use simsimd::SpatialSimilarity;
 
 use crate::approx::ApproxIndex;
 use crate::profiles::{CachePolicy, CpuBatchStrategy, CpuSearchStrategy, TuningProfile};
-use crate::topk::{Neighbor, TopKAccumulator};
+use crate::topk::{Neighbor, TopKAccumulator, topk_from_scores};
 
 /// Maximum rows for the parallel-scores strategy (scores vector <= 1 MB).
 /// Kept low so the sequential top-k pass over the scores buffer stays cheap.
@@ -182,11 +182,7 @@ impl CpuIndex {
                 }
 
                 let result = if let Some(approx_index) = self.approx_index() {
-                    queries
-                        .par_chunks_exact(self.dims)
-                        .take(query_rows)
-                        .map(|query| self.search_approx(query, capped_k, approx_index))
-                        .collect::<Vec<_>>()
+                    self.search_batch_approx(queries, query_rows, capped_k, approx_index)
                 } else {
                     self.search_batch_exact(
                         queries,
@@ -203,11 +199,7 @@ impl CpuIndex {
                 }
                 return result;
             } else if let Some(approx_index) = self.approx_index() {
-                return queries
-                    .par_chunks_exact(self.dims)
-                    .take(query_rows)
-                    .map(|query| self.search_approx(query, capped_k, approx_index))
-                    .collect();
+                return self.search_batch_approx(queries, query_rows, capped_k, approx_index);
             }
         }
 
@@ -235,6 +227,8 @@ impl CpuIndex {
             query_rows,
             prefer_query_parallel,
         ) {
+            CpuBatchStrategy::Gemm => self.search_batch_gemm(queries, query_rows, k),
+            CpuBatchStrategy::GemmChunked => self.search_batch_gemm_chunked(queries, query_rows, k),
             CpuBatchStrategy::MatrixChunked => {
                 self.search_batch_matrix_chunked(queries, query_rows, k)
             }
@@ -249,6 +243,96 @@ impl CpuIndex {
                 .map(|query| self.search_with_profile(query, k, batch_profile))
                 .collect(),
         }
+    }
+
+    /// Batch search via GEMM (matrix multiplication): scores = queries * matrix^T.
+    ///
+    /// Computes all dot products as a single matrix multiply, then extracts top-k
+    /// from each row of the resulting score matrix using O(n) introselect.
+    /// Significantly faster than row-by-row dot products for high-dimensional
+    /// vectors because the GEMM kernel (BLAS `sgemm` or the `matrixmultiply`
+    /// fallback) uses cache-optimal tiling.
+    fn search_batch_gemm(
+        &self,
+        queries: &[f32],
+        query_rows: usize,
+        k: usize,
+    ) -> Vec<Vec<Neighbor>> {
+        use ndarray::ArrayView2;
+
+        let matrix_view = ArrayView2::from_shape((self.rows, self.dims), &self.matrix)
+            .expect("matrix shape should match stored dimensions");
+
+        let queries_view =
+            ArrayView2::from_shape((query_rows, self.dims), &queries[..query_rows * self.dims])
+                .expect("queries shape should match index dimensions");
+
+        // Single GEMM: (query_rows, dims) x (dims, rows) => (query_rows, rows).
+        // ndarray dispatches to BLAS sgemm when a blas-* feature is enabled,
+        // or to matrixmultiply's cache-tiled sgemm otherwise.
+        let scores = queries_view.dot(&matrix_view.t());
+
+        let scores_slice = scores
+            .as_slice()
+            .expect("GEMM output should be in standard (row-major) layout");
+
+        scores_slice
+            .par_chunks_exact(self.rows)
+            .map(|row_scores| topk_from_scores(row_scores, k, 0))
+            .collect()
+    }
+
+    /// Batch search via chunked GEMM for when the full score matrix exceeds memory budget.
+    ///
+    /// Splits the stored matrix into ~64 MB chunks, runs GEMM per chunk, and merges
+    /// per-query top-k results. This enables GEMM acceleration for large matrices
+    /// where the full `query_rows * rows` score matrix would exceed 128 MB.
+    fn search_batch_gemm_chunked(
+        &self,
+        queries: &[f32],
+        query_rows: usize,
+        k: usize,
+    ) -> Vec<Vec<Neighbor>> {
+        use ndarray::{Array2, ArrayView2};
+
+        let queries_view =
+            ArrayView2::from_shape((query_rows, self.dims), &queries[..query_rows * self.dims])
+                .expect("queries shape should match index dimensions");
+
+        // Target ~64 MB per chunk of the stored matrix.
+        let bytes_per_row = self.dims * std::mem::size_of::<f32>();
+        let chunk_rows = ((64 * 1024 * 1024) / bytes_per_row).max(64);
+        let chunk_len = chunk_rows * self.dims;
+
+        let mut accumulators: Vec<TopKAccumulator> =
+            (0..query_rows).map(|_| TopKAccumulator::new(k)).collect();
+
+        for (chunk_idx, chunk) in self.matrix.chunks(chunk_len).enumerate() {
+            let rows_in_chunk = chunk.len() / self.dims;
+            let row_offset = chunk_idx * chunk_rows;
+
+            let chunk_view = ArrayView2::from_shape((rows_in_chunk, self.dims), chunk)
+                .expect("chunk shape should be valid");
+
+            // GEMM: (query_rows, dims) x (dims, rows_in_chunk) => (query_rows, rows_in_chunk)
+            let scores: Array2<f32> = queries_view.dot(&chunk_view.t());
+            let scores_slice = scores
+                .as_slice()
+                .expect("GEMM chunk output should be row-major");
+
+            // Extract top-k per query from this chunk and merge into accumulators.
+            for (query_idx, chunk_scores) in scores_slice.chunks_exact(rows_in_chunk).enumerate() {
+                let chunk_topk = topk_from_scores(chunk_scores, k, row_offset);
+                for neighbor in chunk_topk {
+                    accumulators[query_idx].push(neighbor.index, neighbor.similarity);
+                }
+            }
+        }
+
+        accumulators
+            .into_iter()
+            .map(TopKAccumulator::into_sorted_vec)
+            .collect()
     }
 
     /// Batch search optimized for cache locality by chunking the matrix.
@@ -325,15 +409,90 @@ impl CpuIndex {
         hasher.finish()
     }
 
-    /// Prefilter with the approximate index, then rerank candidates with exact dot products.
+    /// Prefilter with the IVF index, then rerank candidates using per-cluster
+    /// BLAS sgemv on the already-contiguous cluster data (zero-copy).
     fn search_approx(&self, query: &[f32], k: usize, approx_index: &ApproxIndex) -> Vec<Neighbor> {
-        let candidates = approx_index.candidate_indices(query, k);
+        use ndarray::{ArrayView1, ArrayView2};
+
+        let clusters = approx_index.candidate_clusters(query, k);
+        let query_view =
+            ArrayView1::from_shape(self.dims, query).expect("query shape should be valid");
+
         let mut accumulator = TopKAccumulator::new(k);
-        for candidate in candidates {
-            let row = &self.matrix[candidate * self.dims..(candidate + 1) * self.dims];
-            accumulator.push(candidate, dot_product(row, query));
+        for (row_data, indices) in clusters {
+            let n_rows = indices.len();
+            if n_rows == 0 {
+                continue;
+            }
+            if n_rows >= 4 && self.dims >= 8 {
+                let matrix_view = ArrayView2::from_shape((n_rows, self.dims), row_data)
+                    .expect("cluster matrix shape should be valid");
+                let scores = matrix_view.dot(&query_view);
+                let scores_slice = scores
+                    .as_slice()
+                    .expect("sgemv output should be contiguous");
+                for (local_row, &score) in scores_slice.iter().enumerate() {
+                    accumulator.push(indices[local_row], score);
+                }
+            } else {
+                for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
+                    accumulator.push(indices[local_row], dot_product(row, query));
+                }
+            }
         }
         accumulator.into_sorted_vec()
+    }
+
+    /// Batch IVF prefilter + BLAS-optimized exact rerank.
+    ///
+    /// Candidate generation is amortized via GEMM centroid scoring. Each query
+    /// reranks its candidates using per-cluster BLAS sgemv calls over the
+    /// already-contiguous cluster data (no copy needed).
+    fn search_batch_approx(
+        &self,
+        queries: &[f32],
+        query_rows: usize,
+        k: usize,
+        approx_index: &ApproxIndex,
+    ) -> Vec<Vec<Neighbor>> {
+        use ndarray::{ArrayView1, ArrayView2};
+
+        let query_values = &queries[..query_rows * self.dims];
+        let cluster_sets = approx_index.candidate_clusters_batch(query_values, query_rows, k);
+
+        cluster_sets
+            .into_par_iter()
+            .enumerate()
+            .map(|(query_idx, clusters)| {
+                let query = &query_values[query_idx * self.dims..(query_idx + 1) * self.dims];
+                let query_view =
+                    ArrayView1::from_shape(self.dims, query).expect("query shape should be valid");
+                let mut accumulator = TopKAccumulator::new(k);
+                for (row_data, indices) in clusters {
+                    let n_rows = indices.len();
+                    if n_rows == 0 {
+                        continue;
+                    }
+                    // Per-cluster sgemv on already-contiguous data (zero-copy).
+                    if n_rows >= 4 && self.dims >= 8 {
+                        let matrix_view = ArrayView2::from_shape((n_rows, self.dims), row_data)
+                            .expect("cluster matrix shape should be valid");
+                        let scores = matrix_view.dot(&query_view);
+                        let scores_slice = scores
+                            .as_slice()
+                            .expect("sgemv output should be contiguous");
+                        for (local_row, &score) in scores_slice.iter().enumerate() {
+                            accumulator.push(indices[local_row], score);
+                        }
+                    } else {
+                        for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
+                            accumulator.push(indices[local_row], dot_product(row, query));
+                        }
+                    }
+                }
+                accumulator.into_sorted_vec()
+            })
+            .collect()
     }
 
     /// Exact search dispatched through the tuning profile's selected strategy.
@@ -346,11 +505,14 @@ impl CpuIndex {
         let chunked_rows = chunk_rows(self.rows, self.dims);
         match profile.cpu_search_strategy(
             self.rows,
+            self.dims,
             parallel_cutoff(self.dims),
             chunked_rows,
             SCORES_VEC_MAX_ROWS,
+            cfg!(feature = "blas-accelerate"),
         ) {
             CpuSearchStrategy::Serial => self.search_serial(query, k),
+            CpuSearchStrategy::Gemv => self.search_gemv(query, k),
             CpuSearchStrategy::ParallelScores => self.search_parallel_scores(query, k),
             CpuSearchStrategy::ParallelChunked => self.search_parallel_chunked(query, k),
             CpuSearchStrategy::ParallelFold => self.search_parallel_fold(query, k),
@@ -394,6 +556,31 @@ impl CpuIndex {
             accumulator.push(row_index, dot_product(row, query));
         }
         accumulator.into_sorted_vec()
+    }
+
+    /// Single-query search via BLAS `sgemv`: scores = matrix * query.
+    ///
+    /// Computes all dot products as a single matrix-vector multiply using
+    /// ndarray (which dispatches to BLAS `sgemv` when `blas-accelerate` is enabled).
+    /// Then extracts top-k using O(n) introselect. Faster than row-by-row SIMD
+    /// for high-dimensional matrices because the BLAS kernel uses cache-optimal tiling.
+    fn search_gemv(&self, query: &[f32], k: usize) -> Vec<Neighbor> {
+        use ndarray::{ArrayView1, ArrayView2};
+
+        let matrix_view = ArrayView2::from_shape((self.rows, self.dims), &self.matrix)
+            .expect("matrix shape should match stored dimensions");
+
+        let query_view = ArrayView1::from_shape(self.dims, &query[..self.dims])
+            .expect("query shape should match index dimensions");
+
+        // sgemv: (rows, dims) x (dims,) => (rows,)
+        let scores = matrix_view.dot(&query_view);
+
+        let scores_slice = scores
+            .as_slice()
+            .expect("sgemv output should be contiguous");
+
+        topk_from_scores(scores_slice, k, 0)
     }
 
     /// Parallel search splitting the matrix into fixed-size chunks with per-chunk top-k merge.

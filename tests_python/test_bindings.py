@@ -36,8 +36,8 @@ def test_numpy_batch_query() -> None:
 
 def test_backend_property_available() -> None:
     matrix = np.eye(8, dtype=np.float32)
-    model = NNdex(matrix, normalized=True, backend="auto")
-    assert model.backend in {"cpu", "gpu"}
+    model = NNdex(matrix, normalized=True)
+    assert model.backend == "cpu"
 
 
 def test_approx_constructor_flag_is_supported() -> None:
