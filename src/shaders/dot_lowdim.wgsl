@@ -1,6 +1,7 @@
 // Low-dimension dot product shader (dims <= 1024).
 // One thread per matrix row; uses vec4 loads and shared-memory query caching.
 // Supports batched queries via gid.y.
+// 4x loop unrolling for improved instruction-level parallelism.
 
 struct Params {
     rows: u32,
@@ -55,11 +56,26 @@ fn main(
 
     let matrix_base = row * dv4;
 
-    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    for (var col = 0u; col < dv4; col += 1u) {
-        acc = fma(matrix[matrix_base + col], shared_query[col], acc);
+    // 4x unrolled accumulation with independent dependency chains.
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
+
+    let dv4_aligned = dv4 & ~3u;
+    for (var col = 0u; col < dv4_aligned; col += 4u) {
+        let mb = matrix_base + col;
+        acc0 = fma(matrix[mb], shared_query[col], acc0);
+        acc1 = fma(matrix[mb + 1u], shared_query[col + 1u], acc1);
+        acc2 = fma(matrix[mb + 2u], shared_query[col + 2u], acc2);
+        acc3 = fma(matrix[mb + 3u], shared_query[col + 3u], acc3);
     }
 
-    let score = acc.x + acc.y + acc.z + acc.w;
-    output_scores[query_idx * params.rows + row] = score;
+    // Remainder iterations (0-3 vec4s).
+    for (var col = dv4_aligned; col < dv4; col += 1u) {
+        acc0 = fma(matrix[matrix_base + col], shared_query[col], acc0);
+    }
+
+    let combined = (acc0 + acc1) + (acc2 + acc3);
+    output_scores[query_idx * params.rows + row] = dot(combined, vec4<f32>(1.0));
 }

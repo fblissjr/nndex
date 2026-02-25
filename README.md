@@ -82,7 +82,7 @@ print(batch_scores.shape)   # (4, 5)
 
 ### Approximate Nearest Neighbors
 
-Enable `approx=True` for sub-millisecond queries on large matrices (>10000 rows); on smaller matrices, this setting may be ignored due to overhead causing slowdown instead. Uses a dimensionality-reduced prefilter followed by exact reranking.
+Enable `approx=True` for sub-millisecond queries on large matrices: Uses a dimensionality-reduced prefilter followed by exact reranking.
 
 ```python
 index_ann = NNdex(matrix, approx=True)
@@ -187,7 +187,7 @@ fn main() -> Result<(), nndex::NNdexError> {
 ## Notes
 
 - nndex is **NOT** a vector store/database which implies that the vectors can be created/updated/deleted from the matrix, and it is not intending to be. It's intended to be used with a fixed matrix of data, although this crate is so fast that you could reinitialize the `NNdex` without much overhead if needed.
-- For Apple Silicon in particular, the use of the GPU backend (Metal) is not recommended due to the dispatch overhead of `wgpu` being greater than the inference speed. This is not the case with discrete GPUs.
+- For Apple Silicon in particular, the use of the GPU backend (Metal) is not recommended below 100k rows due to the dispatch overhead of `wgpu` being greater than the inference speed. This is not the case with discrete GPUs.
 - BLAS is only supported for macOS because the underlying BLAS library ([accelerate](https://developer.apple.com/accelerate/)) is included by default. There are tradeoffs for Linux/Windows and I am still determining what to do there.
 
 ## API Reference

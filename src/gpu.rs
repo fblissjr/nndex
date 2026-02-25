@@ -28,7 +28,7 @@ const BATCH_CACHE_CAPACITY: usize = 16;
 ///
 /// This avoids per-search buffer/bind-group allocation overhead in common online-query paths while
 /// capping extra memory usage for very large matrices.
-const SINGLE_QUERY_REUSE_MAX_ROWS: usize = 1_000_000;
+const SINGLE_QUERY_REUSE_MAX_ROWS: usize = 16_000_000;
 
 /// Errors specific to GPU index initialization and dispatch.
 #[derive(Debug, Error)]
@@ -505,6 +505,9 @@ impl GpuIndex {
     }
 
     /// Dispatch a single query through the pre-allocated reusable buffer path.
+    ///
+    /// Maps all readback buffers in a single batch before polling to minimize
+    /// host-side synchronization overhead.
     fn dispatch_single_reused(
         &self,
         padded_query: &[f32],
@@ -528,17 +531,20 @@ impl GpuIndex {
                 label: Some("nndex-single-encoder"),
             });
 
-        for chunk in &dispatch.chunks {
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("nndex-single-compute-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
+        // Single compute pass for all chunks, reducing Metal command encoder transitions.
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("nndex-single-compute-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            for chunk in &dispatch.chunks {
                 pass.set_bind_group(0, &chunk.bind_group, &[]);
                 let (wg_x, wg_y) = self.dispatch_dims(chunk.row_count as u32, 1);
                 pass.dispatch_workgroups(wg_x, wg_y, 1);
             }
+        }
+        for chunk in &dispatch.chunks {
             encoder.copy_buffer_to_buffer(
                 &chunk.output_buffer,
                 0,
@@ -549,23 +555,31 @@ impl GpuIndex {
         }
 
         self.queue.submit(Some(encoder.finish()));
+
+        // Batch all readback buffer map operations before polling for a single sync point.
+        let receivers: Vec<_> = dispatch
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let slice = chunk.readback_buffer.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+                rx
+            })
+            .collect();
+
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
 
         let mut accumulator = TopKAccumulator::new(k);
-        for chunk in &dispatch.chunks {
-            let slice = chunk.readback_buffer.slice(..);
-            let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-
-            let mapped = pollster::block_on(receiver.receive());
-            if !matches!(mapped, Some(Ok(()))) {
+        for (chunk, rx) in dispatch.chunks.iter().zip(receivers) {
+            let mapped = rx.recv().map_err(|_| GpuError::MapReadFailed)?;
+            if mapped.is_err() {
                 return Err(GpuError::MapReadFailed);
             }
 
-            let data = slice.get_mapped_range();
+            let data = chunk.readback_buffer.slice(..).get_mapped_range();
             let scores = bytemuck::cast_slice::<u8, f32>(&data);
             for (local_row, &score) in scores.iter().enumerate().take(chunk.row_count) {
                 accumulator.push(chunk.row_start + local_row, score);
@@ -621,6 +635,8 @@ impl GpuIndex {
     }
 
     /// Dispatch a single sub-batch of queries across all matrix chunks.
+    ///
+    /// Maps all readback buffers in a single batch before polling.
     fn dispatch_sub_batch(
         &self,
         padded_queries: &[f32],
@@ -723,26 +739,33 @@ impl GpuIndex {
         }
 
         self.queue.submit(Some(encoder.finish()));
+
+        // Batch all readback buffer map operations before polling.
+        let receivers: Vec<_> = chunk_buffers
+            .iter()
+            .map(|(_, readback_buffer, _)| {
+                let slice = readback_buffer.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+                rx
+            })
+            .collect();
+
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
 
         let mut accumulators: Vec<TopKAccumulator> =
             (0..query_count).map(|_| TopKAccumulator::new(k)).collect();
 
-        for (chunk_idx, chunk) in self.chunks.iter().enumerate() {
+        for ((chunk_idx, chunk), rx) in self.chunks.iter().enumerate().zip(receivers) {
             let (_, readback_buffer, _) = &chunk_buffers[chunk_idx];
-            let slice = readback_buffer.slice(..);
-            let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = sender.send(result);
-            });
-            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-
-            let mapped = pollster::block_on(receiver.receive());
-            if !matches!(mapped, Some(Ok(()))) {
+            let mapped = rx.recv().map_err(|_| GpuError::MapReadFailed)?;
+            if mapped.is_err() {
                 return Err(GpuError::MapReadFailed);
             }
 
-            let data = slice.get_mapped_range();
+            let data = readback_buffer.slice(..).get_mapped_range();
             let scores = bytemuck::cast_slice::<u8, f32>(&data);
 
             for (query_idx, acc) in accumulators.iter_mut().enumerate() {

@@ -1,6 +1,7 @@
 // High-dimension dot product shader (dims > 1024).
 // One workgroup (256 threads) per matrix row; cooperative reduction via shared memory.
 // Supports batched queries via workgroup_id.y.
+// 8x loop unrolling for improved instruction-level parallelism.
 
 struct Params {
     rows: u32,
@@ -41,18 +42,53 @@ fn main(
     let matrix_base = row * dv4;
     let query_base = query_idx * dv4;
 
-    // Each thread accumulates a strided slice of the dot product.
-    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let stride = 256u;
+    let stride8 = stride * 8u;
+
+    // 8x unrolled strided accumulation with independent dependency chains.
+    var a0 = vec4<f32>(0.0);
+    var a1 = vec4<f32>(0.0);
+    var a2 = vec4<f32>(0.0);
+    var a3 = vec4<f32>(0.0);
+    var a4 = vec4<f32>(0.0);
+    var a5 = vec4<f32>(0.0);
+    var a6 = vec4<f32>(0.0);
+    var a7 = vec4<f32>(0.0);
+
     var col = lid;
+    loop {
+        if col + 7u * stride >= dv4 {
+            break;
+        }
+        let c1 = col + stride;
+        let c2 = col + 2u * stride;
+        let c3 = col + 3u * stride;
+        let c4 = col + 4u * stride;
+        let c5 = col + 5u * stride;
+        let c6 = col + 6u * stride;
+        let c7 = col + 7u * stride;
+        a0 = fma(matrix[matrix_base + col], queries[query_base + col], a0);
+        a1 = fma(matrix[matrix_base + c1], queries[query_base + c1], a1);
+        a2 = fma(matrix[matrix_base + c2], queries[query_base + c2], a2);
+        a3 = fma(matrix[matrix_base + c3], queries[query_base + c3], a3);
+        a4 = fma(matrix[matrix_base + c4], queries[query_base + c4], a4);
+        a5 = fma(matrix[matrix_base + c5], queries[query_base + c5], a5);
+        a6 = fma(matrix[matrix_base + c6], queries[query_base + c6], a6);
+        a7 = fma(matrix[matrix_base + c7], queries[query_base + c7], a7);
+        col += stride8;
+    }
+
+    // Remainder: process remaining strided elements.
     loop {
         if col >= dv4 {
             break;
         }
-        acc = fma(matrix[matrix_base + col], queries[query_base + col], acc);
-        col += 256u;
+        a0 = fma(matrix[matrix_base + col], queries[query_base + col], a0);
+        col += stride;
     }
 
-    partial_sums[lid] = acc.x + acc.y + acc.z + acc.w;
+    let combined = (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7);
+    partial_sums[lid] = dot(combined, vec4<f32>(1.0));
     workgroupBarrier();
 
     // Tree reduction across 256 threads (8 steps: 256 -> 128 -> ... -> 1).
