@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nndex = "0.2.0"
+nndex = "0.2.1"
 ```
 
 ## Python Usage
