@@ -184,6 +184,8 @@ fn main() -> Result<(), nndex::NNdexError> {
 
 [BENCHMARK IMAGES TO BE ADDED]
 
+Rough Python benchmarks are available in notebooks/benchmark_cpu_ann_vs_exact.ipynb and notebooks/benchmark_cpu_vs_numpy.ipynb
+
 ## Notes
 
 - nndex is **NOT** a vector store/database which implies that the vectors can be created/updated/deleted from the matrix, and it is not intending to be. It's intended to be used with a fixed matrix of data, although this crate is so fast that you could reinitialize the `NNdex` without much overhead if needed.
