@@ -50,7 +50,7 @@ from nndex import NNdex
 rng = np.random.default_rng(42)
 matrix = rng.normal(size=(50_000, 128)).astype(np.float32)
 
-# Build an index (auto-selects GPU if available, falls back to CPU)
+# Build an index
 index = NNdex(matrix)
 print(index.backend)  # "gpu" or "cpu"
 print(index.rows, index.dims)  # 50000 128
@@ -82,7 +82,7 @@ print(batch_scores.shape)   # (4, 5)
 
 ### Approximate Nearest Neighbors
 
-Enable `approx=True` for faster queries (3x minimum, greater benefit on larger matrices): uses a quick IVF index followed by exact reranking.
+Enable `approx=True` for faster queries (3x minimum with greater benefit on larger matrices): uses a quick IVF index followed by exact reranking.
 
 ```python
 index_ann = NNdex(matrix, approx=True)
@@ -102,7 +102,7 @@ gpu_index = NNdex(matrix, backend="gpu")
 
 ### Pre-Normalized Data
 
-If your embeddings are already unit-normalized, set `normalized=True` to skip the internal normalization step for more computational speed:
+If your embeddings (both base and query) are already unit-normalized, set `normalized=True` to skip the internal normalization step for more computational speed:
 
 ```python
 normalized_matrix = matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
