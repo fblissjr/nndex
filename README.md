@@ -82,7 +82,7 @@ print(batch_scores.shape)   # (4, 5)
 
 ### Approximate Nearest Neighbors
 
-Enable `approx=True` for sub-millisecond queries on large matrices: Uses a dimensionality-reduced prefilter followed by exact reranking.
+Enable `approx=True` for faster queries (3x minimum, greater benefit on larger matrices): uses a quick IVF index followed by exact reranking.
 
 ```python
 index_ann = NNdex(matrix, approx=True)
@@ -184,7 +184,7 @@ fn main() -> Result<(), nndex::NNdexError> {
 
 [BENCHMARK IMAGES TO BE ADDED]
 
-Rough Python benchmarks are available in notebooks/benchmark_cpu_ann_vs_exact.ipynb and notebooks/benchmark_cpu_vs_numpy.ipynb
+Rough Python benchmarks are available in [ANN vs. Exact](notebooks/benchmark_cpu_ann_vs_exact.ipynb) and [vs. numpy](notebooks/benchmark_cpu_vs_numpy.ipynb) Jupyter Notebooks.
 
 ## Notes
 
