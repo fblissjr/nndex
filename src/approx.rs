@@ -1,6 +1,4 @@
 #[cfg(feature = "cpu")]
-use ndarray::ArrayView2;
-#[cfg(feature = "cpu")]
 use rayon::prelude::*;
 
 /// IVF (Inverted File Index) for approximate nearest-neighbor prefiltering.
@@ -153,6 +151,9 @@ impl ApproxIndex {
     /// # Returns
     ///
     /// Vector of `(cluster_row_data_slice, original_indices_slice)` per probed cluster.
+    ///
+    /// UPDATE: By stripping out the ArrayView2 matrix-vector product, we avoid the dynamic allocation overhead of creating an output vector for the centroid scores
+    /// instead, the code will natively use our zero-allocation dot_small inline loop (which already correctly handles SIMD acceleration when the cpu feature is active).
     pub(crate) fn candidate_clusters(&self, query: &[f32], k: usize) -> Vec<(&[f32], &[usize])> {
         debug_assert_eq!(query.len(), self.dims);
 
@@ -162,32 +163,8 @@ impl ApproxIndex {
 
         let nprobe = choose_nprobe(self.nlist, k, self.rows);
 
-        // Use BLAS sgemv for centroid scoring when profitable.
-        #[cfg(feature = "cpu")]
-        let mut centroid_scores: Vec<(usize, f32)> = if self.nlist >= 16 && self.dims >= 16 {
-            use ndarray::{ArrayView1, ArrayView2};
-            let centroids_view = ArrayView2::from_shape((self.nlist, self.dims), &self.centroids)
-                .expect("centroid matrix shape should be valid");
-            let query_view =
-                ArrayView1::from_shape(self.dims, query).expect("query shape should be valid");
-            let scores = centroids_view.dot(&query_view);
-            let scores_slice = scores
-                .as_slice()
-                .expect("centroid sgemv output should be contiguous");
-            scores_slice
-                .iter()
-                .enumerate()
-                .map(|(idx, &s)| (idx, s))
-                .collect()
-        } else {
-            self.centroids
-                .chunks_exact(self.dims)
-                .enumerate()
-                .map(|(idx, centroid)| (idx, dot_small(centroid, query)))
-                .collect()
-        };
-
-        #[cfg(not(feature = "cpu"))]
+        // Stream centroid scores directly using the zero-allocation inner loop.
+        // This completely removes the ndarray dynamic allocation and branching.
         let mut centroid_scores: Vec<(usize, f32)> = self
             .centroids
             .chunks_exact(self.dims)
@@ -249,12 +226,14 @@ impl ApproxIndex {
                 .collect();
         }
 
-        // GEMM: (query_rows, dims) x (nlist, dims)^T => (query_rows, nlist)
+        // 1. Keep the AMX-accelerated GEMM for bulk centroid scoring
+        use ndarray::ArrayView2;
         let queries_view =
             ArrayView2::from_shape((query_rows, self.dims), &queries[..query_rows * self.dims])
                 .expect("query batch shape should be valid");
         let centroids_view = ArrayView2::from_shape((self.nlist, self.dims), &self.centroids)
             .expect("centroid matrix shape should be valid");
+
         let scores = queries_view
             .dot(&centroids_view.t())
             .as_standard_layout()
@@ -263,29 +242,33 @@ impl ApproxIndex {
             .as_slice()
             .expect("centroid GEMM output should be contiguous");
 
-        scores_slice
-            .chunks_exact(self.nlist)
-            .map(|query_scores| {
-                let nprobe = nprobe.min(query_scores.len());
-                let mut indexed: Vec<(usize, f32)> = query_scores
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &s)| (i, s))
-                    .collect();
-                indexed.select_nth_unstable_by(nprobe - 1, |a, b| b.1.total_cmp(&a.1));
+        // 2. Allocate ONE reusable buffer for sorting, eliminating per-query allocations
+        let mut out = Vec::with_capacity(query_rows);
+        let mut indexed_buffer = Vec::with_capacity(self.nlist);
 
-                indexed[..nprobe]
-                    .iter()
-                    .map(|&(cluster_id, _)| {
-                        let start = self.cluster_offsets[cluster_id];
-                        let end = self.cluster_offsets[cluster_id + 1];
-                        let row_data = &self.reordered_matrix[start * self.dims..end * self.dims];
-                        let indices = &self.original_indices[start..end];
-                        (row_data, indices)
-                    })
-                    .collect()
-            })
-            .collect()
+        for query_scores in scores_slice.chunks_exact(self.nlist) {
+            let nprobe = nprobe.min(query_scores.len());
+
+            // Reuse capacity
+            indexed_buffer.clear();
+            indexed_buffer.extend(query_scores.iter().enumerate().map(|(i, &s)| (i, s)));
+            indexed_buffer.select_nth_unstable_by(nprobe - 1, |a, b| b.1.total_cmp(&a.1));
+
+            let clusters = indexed_buffer[..nprobe]
+                .iter()
+                .map(|&(cluster_id, _)| {
+                    let start = self.cluster_offsets[cluster_id];
+                    let end = self.cluster_offsets[cluster_id + 1];
+                    let row_data = &self.reordered_matrix[start * self.dims..end * self.dims];
+                    let indices = &self.original_indices[start..end];
+                    (row_data, indices)
+                })
+                .collect();
+
+            out.push(clusters);
+        }
+
+        out
     }
 }
 

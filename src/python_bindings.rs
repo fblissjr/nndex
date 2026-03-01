@@ -1,5 +1,5 @@
 use numpy::{
-    PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -458,20 +458,36 @@ fn neighbors_to_numpy(py: Python<'_>, neighbors: &[Neighbor]) -> PyResult<Py<PyA
 }
 
 /// Build a `(indices, similarities)` tuple of 2D numpy arrays directly from Rust.
+///
+/// UPDATE: batch_neighbors_to_numpy maps &[Vec<Neighbor>] into Vec<Vec<u64>> and Vec<Vec<f32>>.
+/// For a batch of 16,384 queries, this allocates 32,768 separate heap vectors to satisfy the bridge interface.
+/// To improve, we allocate a single flat vector and instantly reshape it into a 2D matrix directly via NumPy.
 fn batch_neighbors_to_numpy(py: Python<'_>, batch: &[Vec<Neighbor>]) -> PyResult<Py<PyAny>> {
-    let indices: Vec<Vec<u64>> = batch
-        .iter()
-        .map(|row| row.iter().map(|n| n.index as u64).collect())
-        .collect();
-    let similarities: Vec<Vec<f32>> = batch
-        .iter()
-        .map(|row| row.iter().map(|n| n.similarity).collect())
-        .collect();
+    let rows = batch.len();
+    let cols = batch.first().map_or(0, |row| row.len());
 
-    let index_array =
-        PyArray2::from_vec2(py, &indices).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let similarity_array = PyArray2::from_vec2(py, &similarities)
+    let mut flat_indices = Vec::with_capacity(rows * cols);
+    let mut flat_similarities = Vec::with_capacity(rows * cols);
+
+    for row in batch {
+        for n in row.iter().take(cols) {
+            flat_indices.push(n.index as u64);
+            flat_similarities.push(n.similarity);
+        }
+        for _ in row.len()..cols {
+            // Safety padding
+            flat_indices.push(0);
+            flat_similarities.push(0.0);
+        }
+    }
+
+    let index_array = PyArray1::from_vec(py, flat_indices)
+        .reshape((rows, cols))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let similarity_array = PyArray1::from_vec(py, flat_similarities)
+        .reshape((rows, cols))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
     Ok((index_array, similarity_array)
         .into_pyobject(py)?
         .unbind()
