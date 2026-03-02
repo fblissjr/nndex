@@ -59,3 +59,31 @@ class TestEmbedChunks:
         mock_provider.get_embeddings.assert_called_once_with(
             ["find auth"], task="query"
         )
+
+    def test_progress_callback_called(self):
+        """embed_chunks should call progress callback after each batch."""
+        from nndex_cli.embed import embed_chunks
+
+        mock_provider = MagicMock()
+        mock_provider.get_embeddings.side_effect = [
+            [[0.1, 0.2], [0.3, 0.4]],
+            [[0.5, 0.6]],
+        ]
+
+        chunks = [
+            Chunk("a.py", 1, 1, "a", "a"),
+            Chunk("b.py", 1, 1, "b", "b"),
+            Chunk("c.py", 1, 1, "c", "c"),
+        ]
+
+        progress_calls = []
+        def on_progress(done, total):
+            progress_calls.append((done, total))
+
+        embed_chunks(chunks, mock_provider, task="document", batch_size=2,
+                     on_progress=on_progress)
+
+        # Should be called once per batch
+        assert len(progress_calls) == 2
+        assert progress_calls[0] == (2, 3)  # After first batch: 2 of 3 done
+        assert progress_calls[1] == (3, 3)  # After second batch: 3 of 3 done

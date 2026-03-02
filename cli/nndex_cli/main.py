@@ -36,12 +36,18 @@ def cmd_embed(args):
     print(f"model loaded in {time.time() - t0:.1f}s")
 
     # Embed
-    print("embedding chunks ...")
     t0 = time.time()
-    embeddings_list = embed_chunks(chunks, provider, task="document")
+
+    def _progress(done, total):
+        elapsed = time.time() - t0
+        rate = done / elapsed if elapsed > 0 else 0
+        print(f"\r  embedding: {done}/{total} chunks ({rate:.0f}/s)", end="", flush=True)
+
+    embeddings_list = embed_chunks(chunks, provider, task="document",
+                                   on_progress=_progress)
     embeddings = np.array(embeddings_list, dtype=np.float32)
     elapsed = time.time() - t0
-    print(f"embedded {len(chunks)} chunks in {elapsed:.1f}s ({len(chunks)/elapsed:.0f} chunks/s)")
+    print(f"\r  embedded {len(chunks)} chunks in {elapsed:.1f}s ({len(chunks)/elapsed:.0f} chunks/s)")
 
     # Save
     save_embeddings(nndex_dir, embeddings)
