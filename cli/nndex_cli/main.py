@@ -1,6 +1,7 @@
 """nndex CLI -- embed, index, and search code with natural language."""
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -8,7 +9,11 @@ from pathlib import Path
 import numpy as np
 
 
-DEFAULT_MODEL_PATH = "/Users/fredbliss/Storage/google_embeddinggemma-300m"
+DEFAULT_MODEL_PATH = os.environ.get(
+    "NNDEX_MODEL_PATH",
+    "/Users/fredbliss/Storage/google_embeddinggemma-300m",
+)
+DEFAULT_API_URL = os.environ.get("NNDEX_API_URL", "http://localhost:8000")
 
 
 def cmd_embed(args):
@@ -108,6 +113,43 @@ def cmd_info(args):
     print(f"  vectors: {meta['num_chunks']}")
     print(f"  dimensions: {meta['dims']}")
     print(f"  model: {meta['model']}")
+
+
+def _try_load_mlx_provider(model_path: str):
+    """Try to load MLXEmbeddingProvider. Returns None if heylookitsanllm is not installed."""
+    try:
+        from heylook_llm.providers.mlx_embedding_provider import MLXEmbeddingProvider
+    except ImportError:
+        return None
+
+    provider = MLXEmbeddingProvider(
+        model_id="embeddinggemma",
+        config={"model_path": model_path},
+        verbose=False,
+    )
+    provider.load_model()
+    return provider
+
+
+def _load_provider_auto(
+    model_path: str = DEFAULT_MODEL_PATH,
+    api_url: str = DEFAULT_API_URL,
+):
+    """Load embedding provider, preferring local MLX, falling back to HTTP.
+
+    Args:
+        model_path: Path to local model directory (for MLX provider).
+        api_url: URL of embeddings API server (for HTTP fallback).
+
+    Returns:
+        An object with get_embeddings(texts, task=...) method.
+    """
+    provider = _try_load_mlx_provider(model_path)
+    if provider is not None:
+        return provider
+
+    from .http_provider import HTTPEmbeddingProvider
+    return HTTPEmbeddingProvider(api_url=api_url)
 
 
 def _load_provider(model_path: str):
