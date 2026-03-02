@@ -1201,6 +1201,93 @@ mod tests {
         assert!(matches!(err, NNdexError::InvalidTopK));
     }
 
+    #[test]
+    fn batch_approx_matches_single_approx_results() {
+        // Use dims=64 to exercise the ndarray.dot AMX path (n_rows >= 4 && dims >= 8)
+        let rows = 2_048usize;
+        let dims = 64usize;
+        let k = 10usize;
+        let n_queries = 8usize;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let matrix = (0..rows * dims)
+            .map(|_| rng.random_range(-1.0_f32..1.0_f32))
+            .collect::<Vec<_>>();
+        let queries = (0..n_queries * dims)
+            .map(|_| rng.random_range(-1.0_f32..1.0_f32))
+            .collect::<Vec<_>>();
+
+        let approx_index = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                normalized: false,
+                approx: true,
+                backend: BackendPreference::Cpu,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("approx index construction should succeed");
+
+        // Batch query
+        let batch_results = approx_index
+            .search_batch(&queries, n_queries, k)
+            .expect("batch approx query should succeed");
+        assert_eq!(batch_results.len(), n_queries);
+
+        // Single queries should match batch results (same indices, close scores)
+        for q in 0..n_queries {
+            let single = approx_index
+                .search(&queries[q * dims..(q + 1) * dims], k)
+                .expect("single approx query should succeed");
+            let batch_indices: Vec<usize> = batch_results[q].iter().map(|n| n.index).collect();
+            let single_indices: Vec<usize> = single.iter().map(|n| n.index).collect();
+            assert_eq!(
+                batch_indices, single_indices,
+                "query {q}: batch and single should return same indices in same order"
+            );
+            for (b, s) in batch_results[q].iter().zip(single.iter()) {
+                assert!(
+                    (b.similarity - s.similarity).abs() < 1e-4,
+                    "query {q} idx {}: batch score {} vs single score {} differ by more than 1e-4",
+                    b.index,
+                    b.similarity,
+                    s.similarity,
+                );
+            }
+        }
+
+        // Also check recall against exact search
+        let exact_index = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                normalized: false,
+                approx: false,
+                backend: BackendPreference::Cpu,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("exact index construction should succeed");
+
+        for q in 0..n_queries {
+            let exact_top = exact_index
+                .search(&queries[q * dims..(q + 1) * dims], k)
+                .expect("exact query should succeed");
+            let exact_set: HashSet<usize> =
+                exact_top.iter().map(|n| n.index).collect();
+            let overlap = batch_results[q]
+                .iter()
+                .filter(|n| exact_set.contains(&n.index))
+                .count();
+            assert!(
+                overlap >= 5,
+                "query {q}: expected >=5 overlapping results with exact, got {overlap}"
+            );
+        }
+    }
+
     // ---- Padding / normalization helpers ----
 
     #[test]

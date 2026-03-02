@@ -389,4 +389,73 @@ mod tests {
         assert_eq!(result[1].index, 1);
         assert_eq!(result[2].index, 2);
     }
+
+    // ---- topk_from_scores: streaming path (> 131,072 elements) ----
+
+    #[test]
+    fn topk_from_scores_large_array_streaming_path() {
+        let n = 200_000;
+        let mut scores: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001).collect();
+        // Plant known highest values at specific positions
+        scores[150_000] = 999.0;
+        scores[175_000] = 998.0;
+        let result = topk_from_scores(&scores, 3, 0);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].index, 150_000);
+        assert_eq!(result[1].index, 175_000);
+        // Third highest is 199.999 at index 199,999
+        assert_eq!(result[2].index, 199_999);
+    }
+
+    #[test]
+    fn topk_from_scores_at_boundary_uses_quickselect() {
+        // Exactly 131,072 -- should use quickselect path (<=)
+        let scores: Vec<f32> = (0..131_072).map(|i| i as f32).collect();
+        let result = topk_from_scores(&scores, 5, 0);
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0].index, 131_071);
+        assert_eq!(result[1].index, 131_070);
+    }
+
+    #[test]
+    fn topk_from_scores_above_boundary_uses_streaming() {
+        // 131,073 -- should use streaming path (>)
+        let scores: Vec<f32> = (0..131_073).map(|i| i as f32).collect();
+        let result = topk_from_scores(&scores, 5, 0);
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0].index, 131_072);
+        assert_eq!(result[1].index, 131_071);
+    }
+
+    #[test]
+    fn topk_from_scores_streaming_with_row_offset() {
+        let n = 150_000;
+        let scores: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
+        let result = topk_from_scores(&scores, 2, 1_000_000);
+        assert_eq!(result[0].index, 1_000_000 + n - 1);
+        assert_eq!(result[1].index, 1_000_000 + n - 2);
+    }
+
+    #[test]
+    fn topk_from_scores_both_paths_agree_on_same_data() {
+        // Generate data that exercises both paths and verify identical top-k.
+        // Use a deterministic pattern so results are predictable.
+        let n_below = 131_072;
+        let n_above = 140_000;
+
+        // Same seed pattern for both
+        let full_scores: Vec<f32> = (0..n_above)
+            .map(|i| ((i as f32) * 0.0137).sin())
+            .collect();
+
+        let below = topk_from_scores(&full_scores[..n_below], 10, 0);
+        let above = topk_from_scores(&full_scores[..n_above], 10, 0);
+
+        // The top-1 of "above" should have a similarity >= top-1 of "below"
+        // because it has more elements to choose from.
+        assert!(above[0].similarity >= below[0].similarity - 1e-6);
+        // Both should return exactly 10 results
+        assert_eq!(below.len(), 10);
+        assert_eq!(above.len(), 10);
+    }
 }

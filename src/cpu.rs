@@ -13,6 +13,12 @@ use crate::topk::{Neighbor, TopKAccumulator, topk_from_scores};
 /// Kept low so the sequential top-k pass over the scores buffer stays cheap.
 const SCORES_VEC_MAX_ROWS: usize = 4_096;
 
+/// Returns true when `NNDEX_BENCH_VERBOSE=1` is set, checked once per process.
+fn bench_verbose() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("NNDEX_BENCH_VERBOSE").as_deref() == Ok("1"))
+}
+
 /// Maximum entries retained in the single-query LRU result cache.
 const SINGLE_QUERY_CACHE_CAPACITY: usize = 64;
 
@@ -221,12 +227,19 @@ impl CpuIndex {
         batch_profile: TuningProfile,
         prefer_query_parallel: bool,
     ) -> Vec<Vec<Neighbor>> {
-        match TuningProfile::cpu_batch_strategy(
+        let batch_strategy = TuningProfile::cpu_batch_strategy(
             self.rows,
             self.dims,
             query_rows,
             prefer_query_parallel,
-        ) {
+        );
+        if bench_verbose() {
+            eprintln!(
+                "[nndex] batch: rows={} dims={} queries={} k={} -> {:?}",
+                self.rows, self.dims, query_rows, k, batch_strategy,
+            );
+        }
+        match batch_strategy {
             CpuBatchStrategy::Gemm => self.search_batch_gemm(queries, query_rows, k),
             CpuBatchStrategy::GemmChunked => self.search_batch_gemm_chunked(queries, query_rows, k),
             CpuBatchStrategy::MatrixChunked => {
@@ -424,6 +437,12 @@ impl CpuIndex {
     fn search_approx(&self, query: &[f32], k: usize, approx_index: &ApproxIndex) -> Vec<Neighbor> {
         use ndarray::{ArrayView1, ArrayView2};
 
+        if bench_verbose() {
+            eprintln!(
+                "[nndex] approx: rows={} dims={} k={} amx_eligible={}",
+                self.rows, self.dims, k, self.dims >= 8,
+            );
+        }
         let clusters = approx_index.candidate_clusters(query, k);
         let query_view =
             ArrayView1::from_shape(self.dims, query).expect("query shape valid");
@@ -470,6 +489,12 @@ impl CpuIndex {
     ) -> Vec<Vec<Neighbor>> {
         use ndarray::{ArrayView1, ArrayView2};
 
+        if bench_verbose() {
+            eprintln!(
+                "[nndex] batch_approx: rows={} dims={} queries={} k={} amx_eligible={}",
+                self.rows, self.dims, query_rows, k, self.dims >= 8,
+            );
+        }
         let query_values = &queries[..query_rows * self.dims];
         let cluster_sets = approx_index.candidate_clusters_batch(query_values, query_rows, k);
         let dims = self.dims;
@@ -526,14 +551,21 @@ impl CpuIndex {
         profile: TuningProfile,
     ) -> Vec<Neighbor> {
         let chunked_rows = chunk_rows(self.rows, self.dims);
-        match profile.cpu_search_strategy(
+        let search_strategy = profile.cpu_search_strategy(
             self.rows,
             self.dims,
             parallel_cutoff(self.dims),
             chunked_rows,
             SCORES_VEC_MAX_ROWS,
             cfg!(feature = "blas-accelerate"),
-        ) {
+        );
+        if bench_verbose() {
+            eprintln!(
+                "[nndex] search: rows={} dims={} k={} -> {:?}",
+                self.rows, self.dims, k, search_strategy,
+            );
+        }
+        match search_strategy {
             CpuSearchStrategy::Serial => self.search_serial(query, k),
             CpuSearchStrategy::Gemv => self.search_gemv(query, k),
             CpuSearchStrategy::ParallelScores => self.search_parallel_scores(query, k),
@@ -805,6 +837,65 @@ mod tests {
         let a: [f32; 2] = [3.0, 4.0];
         let b: [f32; 2] = [1.0, 2.0];
         assert_abs_diff_eq!(dot_unrolled_8(&a, &b), 11.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_unrolled_8_empty_vectors() {
+        let a: [f32; 0] = [];
+        let b: [f32; 0] = [];
+        assert_abs_diff_eq!(dot_unrolled_8(&a, &b), 0.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_unrolled_8_single_element() {
+        let a: [f32; 1] = [3.0];
+        let b: [f32; 1] = [7.0];
+        assert_abs_diff_eq!(dot_unrolled_8(&a, &b), 21.0, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_unrolled_8_seven_elements() {
+        // 7 elements = zero unrolled iterations, 7 tail iterations
+        let a: [f32; 7] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let b: [f32; 7] = [7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert_abs_diff_eq!(dot_unrolled_8(&a, &b), expected, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_unrolled_8_exactly_eight() {
+        // 8 elements = exactly one unrolled iteration, zero tail
+        let a: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b: [f32; 8] = [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert_abs_diff_eq!(dot_unrolled_8(&a, &b), expected, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_unrolled_8_nine_elements() {
+        // 9 elements = one unrolled iteration + 1 tail iteration
+        let a: [f32; 9] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let b: [f32; 9] = [9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert_abs_diff_eq!(dot_unrolled_8(&a, &b), expected, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_unrolled_8_sixteen_elements() {
+        // 16 elements = two unrolled iterations, zero tail
+        let a: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+        let b: Vec<f32> = (1..=16).rev().map(|i| i as f32).collect();
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        assert_abs_diff_eq!(dot_unrolled_8(&a, &b), expected, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn dot_unrolled_8_mismatched_lengths() {
+        // lhs shorter than rhs -- should use min(len) = 3
+        let a: [f32; 3] = [1.0, 2.0, 3.0];
+        let b: [f32; 5] = [4.0, 5.0, 6.0, 7.0, 8.0];
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum(); // 4+10+18 = 32
+        assert_abs_diff_eq!(dot_unrolled_8(&a, &b), expected, epsilon = 1e-6);
     }
 
     #[test]
