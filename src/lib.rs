@@ -1287,6 +1287,129 @@ mod tests {
         assert_eq!(result.len(), 2);
     }
 
+    #[test]
+    fn single_row_k_one() {
+        // 1-row index, k=1: exercises the k==1 fast path at integration level.
+        let matrix = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let index = NNdex::new(
+            &matrix,
+            1,
+            8,
+            IndexOptions {
+                normalized: true,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("index construction should succeed");
+        let query = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let result = index.search(&query, 1).expect("query should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].index, 0);
+        assert_abs_diff_eq!(result[0].similarity, 1.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn single_row_k_larger_than_one_row() {
+        // 1-row index, k=5: capped_k = min(5,1) = 1, verifies partial result.
+        let matrix = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let index = NNdex::new(
+            &matrix,
+            1,
+            8,
+            IndexOptions {
+                normalized: true,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("index construction should succeed");
+        let query = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let result = index.search(&query, 5).expect("query should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].index, 0);
+        assert_abs_diff_eq!(result[0].similarity, 1.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn batch_search_k_one() {
+        // 8 queries against 100-row index, k=1: exercises k==1 through batch path.
+        // Cross-checks each result against single-query output.
+        let dims = 16;
+        let rows = 100;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let matrix: Vec<f32> = (0..rows * dims).map(|_| rng.random::<f32>() - 0.5).collect();
+        let index = NNdex::new(&matrix, rows, dims, IndexOptions::default())
+            .expect("index construction should succeed");
+
+        let n_queries = 8;
+        let queries: Vec<f32> = (0..n_queries * dims)
+            .map(|_| rng.random::<f32>() - 0.5)
+            .collect();
+
+        let batch = index
+            .search_batch(&queries, n_queries, 1)
+            .expect("batch search should succeed");
+        assert_eq!(batch.len(), n_queries);
+
+        for (qi, neighbors) in batch.iter().enumerate() {
+            assert_eq!(neighbors.len(), 1, "query {qi} should return exactly 1 neighbor");
+            let single = index
+                .search(&queries[qi * dims..(qi + 1) * dims], 1)
+                .expect("single search should succeed");
+            assert_eq!(
+                neighbors[0].index, single[0].index,
+                "query {qi}: batch vs single index mismatch"
+            );
+            assert_abs_diff_eq!(
+                neighbors[0].similarity,
+                single[0].similarity,
+                epsilon = 1e-5
+            );
+        }
+    }
+
+    #[test]
+    fn batch_search_all_negative_scores() {
+        // All stored rows point in +dim0. Query points in -dim0.
+        // Every dot product is negative. Verifies f32::NEG_INFINITY threshold
+        // initialization correctly collects negative scores.
+        let dims = 8;
+        let rows = 5;
+        let mut matrix = vec![0.0_f32; rows * dims];
+        for i in 0..rows {
+            // All rows are unit vectors along dim 0.
+            matrix[i * dims] = 1.0;
+        }
+        let index = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                normalized: true,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("index construction should succeed");
+
+        // Query points opposite to all stored vectors.
+        let mut query = vec![0.0_f32; dims];
+        query[0] = -1.0;
+
+        let n_queries = 4;
+        let queries: Vec<f32> = query.iter().copied().cycle().take(n_queries * dims).collect();
+        let batch = index
+            .search_batch(&queries, n_queries, 3)
+            .expect("batch search should succeed");
+        assert_eq!(batch.len(), n_queries);
+
+        for (qi, neighbors) in batch.iter().enumerate() {
+            assert_eq!(neighbors.len(), 3, "query {qi} should return 3 neighbors");
+            for n in neighbors {
+                assert!(n.index < rows, "query {qi}: index {} out of bounds", n.index);
+                assert_abs_diff_eq!(n.similarity, -1.0, epsilon = 1e-5);
+            }
+        }
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_info_returns_none_for_cpu_backend() {
