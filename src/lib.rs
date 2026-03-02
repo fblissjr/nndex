@@ -1203,7 +1203,11 @@ mod tests {
 
     #[test]
     fn batch_approx_matches_single_approx_results() {
-        // Use dims=64 to exercise the ndarray.dot AMX path (n_rows >= 4 && dims >= 8)
+        // Use dims=64 to exercise the ndarray.dot AMX path (n_rows >= 4 && dims >= 8).
+        // Note: batch and single APX paths may produce slightly different f32 scores
+        // (typically ~1e-6 divergence) because batch GEMM accumulates dot products in
+        // a different order than per-row sgemv. This is inherent to IEEE-754 float
+        // non-associativity, not a bug -- the indices and ranking are identical.
         let rows = 2_048usize;
         let dims = 64usize;
         let k = 10usize;

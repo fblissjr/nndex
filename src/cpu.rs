@@ -455,6 +455,12 @@ impl CpuIndex {
                 continue;
             }
             if n_rows >= 4 && self.dims >= 8 {
+                if bench_verbose() {
+                    eprintln!(
+                        "[nndex]   cluster: n_rows={} dims={} -> ndarray.dot (AMX eligible)",
+                        n_rows, self.dims,
+                    );
+                }
                 let matrix_view =
                     ArrayView2::from_shape((n_rows, self.dims), row_data).expect("cluster shape valid");
                 let scores = matrix_view.dot(&query_view);
@@ -467,6 +473,12 @@ impl CpuIndex {
                     }
                 }
             } else {
+                if bench_verbose() {
+                    eprintln!(
+                        "[nndex]   cluster: n_rows={} dims={} -> simsimd fallback",
+                        n_rows, self.dims,
+                    );
+                }
                 for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
                     let score = dot_product(row, query);
                     if score > threshold {

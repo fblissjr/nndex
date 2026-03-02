@@ -254,12 +254,66 @@ fn bench_batch_gemm_cpu(criterion: &mut criterion::Criterion) {
     group.finish();
 }
 
+/// Configs that trigger the GemmChunked strategy: GEMM-eligible (dims >= 64,
+/// queries >= 4) but score matrix exceeds 128 MB. These use smaller row counts
+/// than the default 10M batch bench so they run faster while still exercising
+/// the chunked code path.
+///
+/// Run with: cargo bench --features blas-accelerate --bench batch -- "batch_gemm_chunked"
+const GEMM_CHUNKED_SIZES: &[(usize, usize, usize)] = &[
+    // (rows, dims, query_rows) -> score_matrix_bytes
+    (500_000, 64, 128),  // 128 * 500K * 4 = 256 MB
+    (260_000, 128, 128), // 128 * 260K * 4 = 133 MB (just over boundary)
+    (300_000, 128, 128), // 128 * 300K * 4 = 153 MB
+    (1_000_000, 64, 64), // 64 * 1M * 4 = 256 MB
+];
+
+fn bench_batch_gemm_chunked_cpu(criterion: &mut criterion::Criterion) {
+    let mut group = criterion.benchmark_group("batch_gemm_chunked/cpu");
+    for &(rows, dims, query_rows) in GEMM_CHUNKED_SIZES {
+        let matrix = generate_matrix(rows, dims, 0xCE44_0000 + rows as u64 + dims as u64);
+        let queries = generate_queries(query_rows, dims, 0xCE44_FFFF + rows as u64 + dims as u64);
+        let index = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                normalized: false,
+                approx: false,
+                backend: BackendPreference::Cpu,
+                enable_cache: false,
+                gpu_device_index: None,
+            },
+        )
+        .expect("CPU GemmChunked index construction should succeed");
+
+        group.bench_with_input(
+            BenchmarkId::new("rows_dims_queries", format!("{rows}x{dims}/q={query_rows}")),
+            &query_rows,
+            |bench, _| {
+                bench.iter(|| {
+                    let result = index.search_batch(
+                        std::hint::black_box(&queries),
+                        std::hint::black_box(query_rows),
+                        std::hint::black_box(10),
+                    );
+                    std::hint::black_box(
+                        result.expect("CPU GemmChunked batch search should succeed"),
+                    );
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn criterion_benches(criterion: &mut Criterion) {
     let mut configured = criterion_with_runtime_defaults().configure_from_args();
     let _ = criterion;
     bench_batch_cpu(&mut configured);
     bench_batch_cpu_ann(&mut configured);
     bench_batch_gemm_cpu(&mut configured);
+    bench_batch_gemm_chunked_cpu(&mut configured);
     #[cfg(feature = "gpu")]
     {
         bench_batch_gpu(&mut configured);
