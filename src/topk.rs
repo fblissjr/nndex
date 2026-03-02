@@ -76,6 +76,7 @@ impl TopKAccumulator {
 
     /// Insert a candidate into the heap. Callers MUST ensure `similarity > self.min_threshold`
     /// before calling -- the k==1 fast path unconditionally overwrites, relying on this invariant.
+    #[cold]
     pub(crate) fn push_slow(&mut self, index: usize, similarity: f32) {
         if self.k == 1 {
             self.best_item = Some(HeapItem { index, similarity });

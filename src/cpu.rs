@@ -13,12 +13,6 @@ use crate::topk::{Neighbor, TopKAccumulator, topk_from_scores};
 /// Kept low so the sequential top-k pass over the scores buffer stays cheap.
 const SCORES_VEC_MAX_ROWS: usize = 4_096;
 
-/// Returns true when `NNDEX_BENCH_VERBOSE=1` is set, checked once per process.
-fn bench_verbose() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("NNDEX_BENCH_VERBOSE").as_deref() == Ok("1"))
-}
-
 /// Maximum entries retained in the single-query LRU result cache.
 const SINGLE_QUERY_CACHE_CAPACITY: usize = 64;
 
@@ -233,12 +227,6 @@ impl CpuIndex {
             query_rows,
             prefer_query_parallel,
         );
-        if bench_verbose() {
-            eprintln!(
-                "[nndex] batch: rows={} dims={} queries={} k={} -> {:?}",
-                self.rows, self.dims, query_rows, k, batch_strategy,
-            );
-        }
         match batch_strategy {
             CpuBatchStrategy::Gemm => self.search_batch_gemm(queries, query_rows, k),
             CpuBatchStrategy::GemmChunked => self.search_batch_gemm_chunked(queries, query_rows, k),
@@ -437,58 +425,28 @@ impl CpuIndex {
     fn search_approx(&self, query: &[f32], k: usize, approx_index: &ApproxIndex) -> Vec<Neighbor> {
         use ndarray::{ArrayView1, ArrayView2};
 
-        if bench_verbose() {
-            eprintln!(
-                "[nndex] approx: rows={} dims={} k={} amx_eligible={}",
-                self.rows, self.dims, k, self.dims >= 8,
-            );
-        }
         let clusters = approx_index.candidate_clusters(query, k);
         let query_view =
             ArrayView1::from_shape(self.dims, query).expect("query shape valid");
-        let mut acc = TopKAccumulator::new(k);
-        let mut threshold = acc.min_threshold;
+        let mut accumulator = TopKAccumulator::new(k);
 
         for (row_data, indices) in clusters {
             let n_rows = indices.len();
-            if n_rows == 0 {
-                continue;
-            }
             if n_rows >= 4 && self.dims >= 8 {
-                if bench_verbose() {
-                    eprintln!(
-                        "[nndex]   cluster: n_rows={} dims={} -> ndarray.dot (AMX eligible)",
-                        n_rows, self.dims,
-                    );
-                }
                 let matrix_view =
                     ArrayView2::from_shape((n_rows, self.dims), row_data).expect("cluster shape valid");
                 let scores = matrix_view.dot(&query_view);
-                for (local_row, &score) in
-                    scores.as_slice().expect("contiguous").iter().enumerate()
-                {
-                    if score > threshold {
-                        acc.push_slow(indices[local_row], score);
-                        threshold = acc.min_threshold;
-                    }
+                let scores_slice = scores.as_slice().expect("contiguous");
+                for (local_row, &score) in scores_slice.iter().enumerate() {
+                    accumulator.push(indices[local_row], score);
                 }
             } else {
-                if bench_verbose() {
-                    eprintln!(
-                        "[nndex]   cluster: n_rows={} dims={} -> simsimd fallback",
-                        n_rows, self.dims,
-                    );
-                }
                 for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
-                    let score = dot_product(row, query);
-                    if score > threshold {
-                        acc.push_slow(indices[local_row], score);
-                        threshold = acc.min_threshold;
-                    }
+                    accumulator.push(indices[local_row], dot_product(row, query));
                 }
             }
         }
-        acc.into_sorted_vec()
+        accumulator.into_sorted_vec()
     }
 
     /// Batch IVF prefilter + rerank with AMX for large clusters.
@@ -501,12 +459,6 @@ impl CpuIndex {
     ) -> Vec<Vec<Neighbor>> {
         use ndarray::{ArrayView1, ArrayView2};
 
-        if bench_verbose() {
-            eprintln!(
-                "[nndex] batch_approx: rows={} dims={} queries={} k={} amx_eligible={}",
-                self.rows, self.dims, query_rows, k, self.dims >= 8,
-            );
-        }
         let query_values = &queries[..query_rows * self.dims];
         let cluster_sets = approx_index.candidate_clusters_batch(query_values, query_rows, k);
         let dims = self.dims;
@@ -518,39 +470,27 @@ impl CpuIndex {
                 let query = &query_values[query_idx * dims..(query_idx + 1) * dims];
                 let query_view =
                     ArrayView1::from_shape(dims, query).expect("query shape valid");
-                let mut acc = TopKAccumulator::new(k);
-                let mut threshold = acc.min_threshold;
+                let mut accumulator = TopKAccumulator::new(k);
 
                 for (row_data, indices) in clusters {
                     let n_rows = indices.len();
-                    if n_rows == 0 {
-                        continue;
-                    }
                     if n_rows >= 4 && dims >= 8 {
                         let matrix_view =
                             ArrayView2::from_shape((n_rows, dims), row_data)
                                 .expect("cluster shape valid");
                         let scores = matrix_view.dot(&query_view);
-                        for (local_row, &score) in
-                            scores.as_slice().expect("contiguous").iter().enumerate()
-                        {
-                            if score > threshold {
-                                acc.push_slow(indices[local_row], score);
-                                threshold = acc.min_threshold;
-                            }
+                        let scores_slice = scores.as_slice().expect("contiguous");
+                        for (local_row, &score) in scores_slice.iter().enumerate() {
+                            accumulator.push(indices[local_row], score);
                         }
                     } else {
                         for (local_row, row) in row_data.chunks_exact(dims).enumerate() {
-                            let score = dot_product(row, query);
-                            if score > threshold {
-                                acc.push_slow(indices[local_row], score);
-                                threshold = acc.min_threshold;
-                            }
+                            accumulator.push(indices[local_row], dot_product(row, query));
                         }
                     }
                 }
 
-                acc.into_sorted_vec()
+                accumulator.into_sorted_vec()
             })
             .collect()
     }
@@ -571,12 +511,6 @@ impl CpuIndex {
             SCORES_VEC_MAX_ROWS,
             cfg!(feature = "blas-accelerate"),
         );
-        if bench_verbose() {
-            eprintln!(
-                "[nndex] search: rows={} dims={} k={} -> {:?}",
-                self.rows, self.dims, k, search_strategy,
-            );
-        }
         match search_strategy {
             CpuSearchStrategy::Serial => self.search_serial(query, k),
             CpuSearchStrategy::Gemv => self.search_gemv(query, k),
