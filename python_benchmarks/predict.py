@@ -43,7 +43,7 @@ def simsimd_predict(
         raise RuntimeError("simsimd is not installed")
     query_norm = query / max(float(np.linalg.norm(query)), 1e-12)
     distances = np.asarray(
-        simsimd.cdist(matrix_norm, query_norm.reshape(1, -1), "cosine"),
+        simsimd.cdist(query_norm.reshape(1, -1), matrix_norm, "cosine"),
         dtype=np.float32,
     ).reshape(-1)
     scores = 1.0 - distances

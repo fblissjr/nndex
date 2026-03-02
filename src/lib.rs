@@ -1208,6 +1208,10 @@ mod tests {
         // (typically ~1e-6 divergence) because batch GEMM accumulates dot products in
         // a different order than per-row sgemv. This is inherent to IEEE-754 float
         // non-associativity, not a bug -- the indices and ranking are identical.
+        //
+        // Assumption: candidate_clusters and candidate_clusters_batch return equivalent
+        // cluster sets in equivalent order for equivalent queries. If that changes,
+        // the strict index ordering assertion below may need to become set-based.
         let rows = 2_048usize;
         let dims = 64usize;
         let k = 10usize;
