@@ -14,6 +14,7 @@ uv.lock
 AGENTS.md
 CLAUDE.md
 /output
+internal/
 Cargo.lock
 
 # Added by cargo
