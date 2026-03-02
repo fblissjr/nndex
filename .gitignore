@@ -16,6 +16,7 @@ CLAUDE.md
 /output
 internal/
 Cargo.lock
+coderef/
 
 # Added by cargo
 /target

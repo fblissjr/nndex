@@ -1,5 +1,12 @@
-"""File discovery and chunking for code search indexing."""
+"""File discovery and chunking for code search indexing.
 
+Supports AST-aware chunking for Python (via ast module) and heuristic
+definition-boundary chunking for JS/TS/Rust. Falls back to sliding
+window for other file types or on parse failure.
+"""
+
+import ast
+import re
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
@@ -123,6 +130,159 @@ def discover_files(root: Path) -> List[Path]:
     return results
 
 
+def _python_definition_lines(source: str) -> List[int]:
+    """Use Python AST to find top-level definition start lines.
+
+    Returns sorted list of 1-based line numbers where top-level
+    functions, classes, or async functions start.
+    Returns empty list on syntax error.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    lines = []
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
+# Heuristic patterns for definition boundaries in non-Python languages.
+# These match the start of top-level definitions (not indented).
+_DEFINITION_PATTERNS = {
+    # Rust: fn, struct, enum, impl, mod, trait, type, const, static
+    ".rs": re.compile(
+        r'^(?:pub(?:\(crate\))?\s+)?(?:async\s+)?(?:unsafe\s+)?'
+        r'(?:fn|struct|enum|impl|mod|trait|type|const|static)\s',
+    ),
+    # JS/TS: function, class, const/let/var (arrow fns), export variants
+    ".js": re.compile(
+        r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class)\s',
+    ),
+    ".ts": re.compile(
+        r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class|interface|type|enum)\s',
+    ),
+    ".jsx": re.compile(
+        r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class)\s',
+    ),
+    ".tsx": re.compile(
+        r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?|class|interface|type|enum)\s',
+    ),
+}
+
+
+def _heuristic_definition_lines(source: str, suffix: str) -> List[int]:
+    """Find definition boundary lines using regex heuristics.
+
+    Returns sorted list of 1-based line numbers.
+    """
+    pattern = _DEFINITION_PATTERNS.get(suffix)
+    if pattern is None:
+        return []
+
+    lines = []
+    for i, line in enumerate(source.split("\n"), 1):
+        if pattern.match(line):
+            lines.append(i)
+    return lines
+
+
+def _get_definition_boundaries(source: str, suffix: str) -> List[int]:
+    """Get definition boundary lines for a file.
+
+    Uses AST for Python, heuristics for JS/TS/Rust.
+    Returns empty list if no boundaries found (falls back to sliding window).
+    """
+    if suffix == ".py":
+        return _python_definition_lines(source)
+    return _heuristic_definition_lines(source, suffix)
+
+
+def _chunk_by_definitions(
+    lines: List[str],
+    file_path: str,
+    boundaries: List[int],
+    max_chars: int,
+) -> List[Chunk]:
+    """Split file into chunks aligned to definition boundaries.
+
+    Groups consecutive definitions until adding the next one would
+    exceed max_chars, then starts a new chunk. No overlap between chunks.
+    """
+    if not boundaries:
+        return []
+
+    # Convert 1-based boundary lines to 0-based indices into lines list
+    # Each segment: [boundary_start, next_boundary_start) in the lines list
+    segments = []
+    for i, boundary in enumerate(boundaries):
+        start = boundary - 1  # 0-based
+        if i + 1 < len(boundaries):
+            end = boundaries[i + 1] - 1
+        else:
+            end = len(lines)
+        segments.append((start, end))
+
+    # Preamble: lines before first definition (imports, comments, etc.)
+    preamble_end = boundaries[0] - 1
+    preamble = "\n".join(lines[:preamble_end]).rstrip()
+
+    chunks = []
+    current_lines_start = 0  # 0-based start of current chunk
+    current_parts = []
+    current_chars = 0
+
+    if preamble:
+        current_parts.append(preamble)
+        current_chars = len(preamble)
+        current_lines_start = 0
+
+    for seg_start, seg_end in segments:
+        segment_text = "\n".join(lines[seg_start:seg_end]).rstrip()
+        segment_chars = len(segment_text)
+
+        # If adding this segment would exceed max_chars and we already have content
+        if current_parts and current_chars + segment_chars + 1 > max_chars:
+            # Flush current chunk
+            content = "\n".join(current_parts)
+            # Recalculate actual line range from content
+            chunk_line_count = content.count("\n") + 1
+            preview = content[:100].replace("\n", " ").strip()
+            chunks.append(Chunk(
+                file_path=file_path,
+                start_line=current_lines_start + 1,
+                end_line=current_lines_start + chunk_line_count,
+                content=content,
+                preview=preview,
+            ))
+            # Start new chunk
+            current_parts = [segment_text]
+            current_chars = segment_chars
+            current_lines_start = seg_start
+        else:
+            if not current_parts:
+                current_lines_start = seg_start if not preamble else 0
+            current_parts.append(segment_text)
+            current_chars += segment_chars + 1
+
+    # Flush remaining
+    if current_parts:
+        content = "\n".join(current_parts)
+        chunk_line_count = content.count("\n") + 1
+        preview = content[:100].replace("\n", " ").strip()
+        chunks.append(Chunk(
+            file_path=file_path,
+            start_line=current_lines_start + 1,
+            end_line=current_lines_start + chunk_line_count,
+            content=content,
+            preview=preview,
+        ))
+
+    return chunks
+
+
 def chunk_file(
     path: Path,
     max_chars: int = 4000,
@@ -130,12 +290,14 @@ def chunk_file(
 ) -> List[Chunk]:
     """Split a file into chunks for embedding.
 
-    Uses a simple line-based sliding window. For small files, returns a single chunk.
+    Tries AST-aware chunking first (Python via ast, JS/TS/Rust via heuristics)
+    to align chunk boundaries with code definitions. Falls back to a line-based
+    sliding window for unsupported languages or when AST parsing fails.
 
     Args:
         path: File to chunk.
         max_chars: Approximate max characters per chunk.
-        overlap_lines: Number of lines to overlap between chunks.
+        overlap_lines: Number of lines to overlap between chunks (sliding window only).
 
     Returns:
         List of Chunk objects.
@@ -162,7 +324,15 @@ def chunk_file(
             preview=preview,
         )]
 
-    # Split into overlapping chunks
+    # Try AST-aware chunking for supported languages
+    suffix = path.suffix.lower()
+    boundaries = _get_definition_boundaries(text, suffix)
+    if boundaries:
+        ast_chunks = _chunk_by_definitions(lines, file_path, boundaries, max_chars)
+        if ast_chunks:
+            return ast_chunks
+
+    # Fallback: split into overlapping chunks by line count
     chunks = []
     i = 0
     while i < len(lines):

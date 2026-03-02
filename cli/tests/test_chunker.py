@@ -142,6 +142,152 @@ class TestChunkFile:
             assert found, f"Line missing from chunks: {line[:50]}"
 
 
+class TestASTChunking:
+    """Test AST-aware chunking for Python/JS/Rust files.
+
+    These tests verify that chunk boundaries align with code definition
+    boundaries rather than splitting arbitrarily at character counts.
+    """
+
+    def test_python_function_not_split_across_chunks(self, tmp_path):
+        """A function that fits in max_chars should never be split across chunks.
+
+        The sliding window approach would split this in the middle of a function.
+        AST-aware chunking should keep each function intact.
+        """
+        from nndex_cli.chunker import chunk_file
+
+        py_file = tmp_path / "funcs.py"
+        # Each function is ~80 chars. With max_chars=200, sliding window
+        # would put the cut wherever 200 chars lands (possibly mid-function).
+        # AST chunking should split between functions instead.
+        py_file.write_text(
+            'def alpha():\n'
+            '    """Alpha function."""\n'
+            '    x = 1\n'
+            '    y = 2\n'
+            '    return x + y\n'
+            '\n'
+            '\n'
+            'def beta():\n'
+            '    """Beta function."""\n'
+            '    a = 10\n'
+            '    b = 20\n'
+            '    return a * b\n'
+            '\n'
+            '\n'
+            'def gamma():\n'
+            '    """Gamma function."""\n'
+            '    p = 100\n'
+            '    q = 200\n'
+            '    return p - q\n'
+        )
+        chunks = chunk_file(py_file, max_chars=200)
+        assert len(chunks) >= 2
+        # Key assertion: no function definition should be split across chunks.
+        # Each "def X():" and its "return" should be in the same chunk.
+        for func, ret_val in [("alpha", "x + y"), ("beta", "a * b"), ("gamma", "p - q")]:
+            chunks_with_def = [c for c in chunks if f"def {func}" in c.content]
+            assert len(chunks_with_def) == 1, f"def {func} in {len(chunks_with_def)} chunks"
+            assert ret_val in chunks_with_def[0].content, (
+                f"{func}'s return value split from its definition"
+            )
+
+    def test_python_keeps_class_together(self, tmp_path):
+        """A small class should stay in a single chunk."""
+        from nndex_cli.chunker import chunk_file
+
+        py_file = tmp_path / "myclass.py"
+        py_file.write_text(
+            'class MyClass:\n'
+            '    def __init__(self):\n'
+            '        self.value = 0\n'
+            '\n'
+            '    def increment(self):\n'
+            '        self.value += 1\n'
+        )
+        chunks = chunk_file(py_file, max_chars=4000)
+        assert len(chunks) == 1
+        assert "MyClass" in chunks[0].content
+        assert "increment" in chunks[0].content
+
+    def test_python_falls_back_on_syntax_error(self, tmp_path):
+        """Invalid Python should fall back to sliding window chunking."""
+        from nndex_cli.chunker import chunk_file
+
+        py_file = tmp_path / "bad.py"
+        py_file.write_text(
+            'def broken(\n'
+            '    # missing closing paren and colon\n'
+            '    return 1\n'
+            '\n'
+            'def also_broken(\n'
+            '    return 2\n'
+        )
+        # Should not crash, falls back to line-based chunking
+        chunks = chunk_file(py_file, max_chars=4000)
+        assert len(chunks) >= 1
+        assert "broken" in chunks[0].content
+
+    def test_rust_fn_not_split_across_chunks(self, tmp_path):
+        """Rust functions should not be split across chunks."""
+        from nndex_cli.chunker import chunk_file
+
+        rs_file = tmp_path / "lib.rs"
+        rs_file.write_text(
+            'use std::io;\n'
+            '\n'
+            'pub fn search(query: &str) -> Vec<usize> {\n'
+            '    let mut results = Vec::new();\n'
+            '    results\n'
+            '}\n'
+            '\n'
+            'pub fn index(data: &[f32]) -> Index {\n'
+            '    Index::new(data)\n'
+            '}\n'
+            '\n'
+            'fn helper() -> bool {\n'
+            '    true\n'
+            '}\n'
+        )
+        chunks = chunk_file(rs_file, max_chars=150)
+        assert len(chunks) >= 2
+        # Each fn definition and its body should be in exactly one chunk
+        for fn_name in ("search", "index", "helper"):
+            chunks_with_fn = [c for c in chunks if f"fn {fn_name}" in c.content]
+            assert len(chunks_with_fn) == 1, f"fn {fn_name} in {len(chunks_with_fn)} chunks"
+
+    def test_js_function_not_split_across_chunks(self, tmp_path):
+        """JS functions/classes should not be split across chunks."""
+        from nndex_cli.chunker import chunk_file
+
+        js_file = tmp_path / "app.js"
+        js_file.write_text(
+            'import { foo } from "bar";\n'
+            '\n'
+            'function handleRequest(req) {\n'
+            '    return req.body;\n'
+            '}\n'
+            '\n'
+            'class Router {\n'
+            '    constructor() {\n'
+            '        this.routes = [];\n'
+            '    }\n'
+            '}\n'
+            '\n'
+            'export function createApp() {\n'
+            '    return new Router();\n'
+            '}\n'
+        )
+        chunks = chunk_file(js_file, max_chars=150)
+        assert len(chunks) >= 2
+        # Each definition should be in exactly one chunk
+        # (Use definition patterns to avoid matching references like "new Router()")
+        for pattern in ("function handleRequest", "class Router", "function createApp"):
+            matching = [c for c in chunks if pattern in c.content]
+            assert len(matching) == 1, f"'{pattern}' in {len(matching)} chunks"
+
+
 class TestChunkDirectory:
     """Test chunking all files in a directory."""
 
