@@ -18,7 +18,7 @@ nndex = "nndex_cli.main:main"
 
 [tool.uv.sources]
 nndex = { path = ".." }
-heylookitsanllm = { path = "../../heylookitsanllm" }
+heylookitsanllm = { git = "https://github.com/fblissjr/heylookitsanllm" }
 
 [dependency-groups]
 dev = [
