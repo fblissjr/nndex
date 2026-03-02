@@ -475,7 +475,9 @@ fn batch_neighbors_to_numpy(py: Python<'_>, batch: &[Vec<Neighbor>]) -> PyResult
             flat_similarities.push(n.similarity);
         }
         for _ in row.len()..cols {
-            // Safety padding
+            // Numpy requires rectangular arrays. Short rows are padded with
+            // (index=0, similarity=0.0). Callers should treat similarity==0.0
+            // as the padding sentinel, since index=0 is a valid row index.
             flat_indices.push(0);
             flat_similarities.push(0.0);
         }

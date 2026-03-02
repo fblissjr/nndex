@@ -78,6 +78,7 @@ impl TopKAccumulator {
     /// before calling -- the k==1 fast path unconditionally overwrites, relying on this invariant.
     #[cold]
     pub(crate) fn push_slow(&mut self, index: usize, similarity: f32) {
+        debug_assert!(similarity > self.min_threshold, "push_slow called with score ({similarity}) <= threshold ({}); callers must pre-check", self.min_threshold);
         if self.k == 1 {
             self.best_item = Some(HeapItem { index, similarity });
             self.min_threshold = similarity;
@@ -346,6 +347,19 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].index, 1);
         assert_eq!(result[1].index, 2);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "push_slow called with score")]
+    fn push_slow_debug_assert_fires_on_invariant_violation() {
+        let mut acc = TopKAccumulator::new(3);
+        acc.push(0, 0.5);
+        acc.push(1, 0.6);
+        acc.push(2, 0.7);
+        // Heap is full, min_threshold = 0.5. Calling push_slow with score <= threshold
+        // should trigger the debug_assert.
+        acc.push_slow(3, 0.3);
     }
 
     // ---- topk_from_scores ----

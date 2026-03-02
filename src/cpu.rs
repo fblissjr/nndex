@@ -432,6 +432,9 @@ impl CpuIndex {
 
         for (row_data, indices) in clusters {
             let n_rows = indices.len();
+            if n_rows == 0 {
+                continue;
+            }
             if n_rows >= 4 && self.dims >= 8 {
                 let matrix_view =
                     ArrayView2::from_shape((n_rows, self.dims), row_data).expect("cluster shape valid");
@@ -474,6 +477,9 @@ impl CpuIndex {
 
                 for (row_data, indices) in clusters {
                     let n_rows = indices.len();
+                    if n_rows == 0 {
+                        continue;
+                    }
                     if n_rows >= 4 && dims >= 8 {
                         let matrix_view =
                             ArrayView2::from_shape((n_rows, dims), row_data)
