@@ -152,8 +152,10 @@ impl ApproxIndex {
     ///
     /// Vector of `(cluster_row_data_slice, original_indices_slice)` per probed cluster.
     ///
-    /// UPDATE: By stripping out the ArrayView2 matrix-vector product, we avoid the dynamic allocation overhead of creating an output vector for the centroid scores
-    /// instead, the code will natively use our zero-allocation dot_small inline loop (which already correctly handles SIMD acceleration when the cpu feature is active).
+    /// Return candidate data for a single query: contiguous row data + original indices.
+    ///
+    /// Uses ndarray sgemv (BLAS/AMX) for centroid scoring when nlist and dims are
+    /// large enough to benefit, falling back to the scalar dot_small loop otherwise.
     pub(crate) fn candidate_clusters(&self, query: &[f32], k: usize) -> Vec<(&[f32], &[usize])> {
         debug_assert_eq!(query.len(), self.dims);
 
@@ -163,15 +165,40 @@ impl ApproxIndex {
 
         let nprobe = choose_nprobe(self.nlist, k, self.rows);
 
-        // Stream centroid scores directly using the zero-allocation inner loop.
-        // This completely removes the ndarray dynamic allocation and branching.
-        let mut centroid_scores: Vec<(usize, f32)> = self
+        // Use ndarray sgemv for centroid scoring when large enough to benefit from AMX.
+        #[cfg(feature = "cpu")]
+        let centroid_scores = if self.nlist >= 16 && self.dims >= 16 {
+            use ndarray::{ArrayView1, ArrayView2};
+            let centroids_view =
+                ArrayView2::from_shape((self.nlist, self.dims), &self.centroids)
+                    .expect("centroid shape valid");
+            let query_view =
+                ArrayView1::from_shape(self.dims, query).expect("query shape valid");
+            let scores = centroids_view.dot(&query_view);
+            scores
+                .as_slice()
+                .expect("contiguous")
+                .iter()
+                .enumerate()
+                .map(|(idx, &s)| (idx, s))
+                .collect::<Vec<(usize, f32)>>()
+        } else {
+            self.centroids
+                .chunks_exact(self.dims)
+                .enumerate()
+                .map(|(idx, centroid)| (idx, dot_small(centroid, query)))
+                .collect::<Vec<(usize, f32)>>()
+        };
+
+        #[cfg(not(feature = "cpu"))]
+        let centroid_scores: Vec<(usize, f32)> = self
             .centroids
             .chunks_exact(self.dims)
             .enumerate()
             .map(|(idx, centroid)| (idx, dot_small(centroid, query)))
             .collect();
 
+        let mut centroid_scores = centroid_scores;
         let nprobe = nprobe.min(centroid_scores.len());
         centroid_scores.select_nth_unstable_by(nprobe - 1, |a, b| b.1.total_cmp(&a.1));
 

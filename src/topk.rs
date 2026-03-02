@@ -46,7 +46,7 @@ pub(crate) struct TopKAccumulator {
     heap: BinaryHeap<Reverse<HeapItem>>,
     best_item: Option<HeapItem>,
     /// Cached minimum similarity in the heap for O(1) fast-reject.
-    min_threshold: f32,
+    pub(crate) min_threshold: f32,
 }
 
 impl TopKAccumulator {
@@ -74,8 +74,7 @@ impl TopKAccumulator {
         self.push_slow(index, similarity);
     }
 
-    #[cold]
-    fn push_slow(&mut self, index: usize, similarity: f32) {
+    pub(crate) fn push_slow(&mut self, index: usize, similarity: f32) {
         if self.k == 1 {
             self.best_item = Some(HeapItem { index, similarity });
             self.min_threshold = similarity;
@@ -169,12 +168,41 @@ pub(crate) fn topk_from_scores(scores: &[f32], k: usize, row_offset: usize) -> V
         return Vec::new();
     }
 
-    // Stream directly into the accumulator to eliminate the 80MB per-query allocation
-    let mut acc = TopKAccumulator::new(capped_k);
-    for (i, &score) in scores.iter().enumerate() {
-        acc.push(i + row_offset, score);
+    if scores.len() > 131_072 {
+        // Stream with hoisted threshold -- avoids multi-MB allocation
+        let mut acc = TopKAccumulator::new(capped_k);
+        let mut threshold = acc.min_threshold;
+        for (i, &score) in scores.iter().enumerate() {
+            if score > threshold {
+                acc.push_slow(i + row_offset, score);
+                threshold = acc.min_threshold;
+            }
+        }
+        return acc.into_sorted_vec();
     }
-    acc.into_sorted_vec()
+
+    // O(n) quickselect for moderate arrays
+    let mut indexed: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (i, s))
+        .collect();
+    indexed.select_nth_unstable_by(capped_k - 1, |a, b| {
+        b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+    });
+    let mut result: Vec<Neighbor> = indexed[..capped_k]
+        .iter()
+        .map(|&(idx, sim)| Neighbor {
+            index: idx + row_offset,
+            similarity: sim,
+        })
+        .collect();
+    result.sort_by(|a, b| {
+        b.similarity
+            .total_cmp(&a.similarity)
+            .then_with(|| a.index.cmp(&b.index))
+    });
+    result
 }
 
 #[cfg(test)]

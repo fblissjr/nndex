@@ -320,14 +320,15 @@ impl CpuIndex {
                 .as_slice()
                 .expect("GEMM chunk output should be row-major");
 
-            // Extract top-k per query from this chunk and merge into accumulators.
-            // UPDATE: search_batch_gemm_chunked calls topk_from_scores which allocates an intermediate Vec<Neighbor> for every chunk, which we iterate over and then immediately discard.
-            // Now that TopKAccumulator is entirely zero-allocation, just stream the chunk scores straight into the global query accumulators.
-            // Because they persist across chunks, the fast-reject threshold gets strictly more efficient on every iteration.
+            // Stream chunk scores into global accumulators with hoisted threshold.
             for (query_idx, chunk_scores) in scores_slice.chunks_exact(rows_in_chunk).enumerate() {
                 let acc = &mut accumulators[query_idx];
+                let mut threshold = acc.min_threshold;
                 for (local_row, &score) in chunk_scores.iter().enumerate() {
-                    acc.push(row_offset + local_row, score);
+                    if score > threshold {
+                        acc.push_slow(row_offset + local_row, score);
+                        threshold = acc.min_threshold;
+                    }
                 }
             }
         }
@@ -362,18 +363,18 @@ impl CpuIndex {
                         .map(|_| TopKAccumulator::new(k))
                         .collect::<Vec<_>>()
                 },
-                // UPDATE: In search_batch_matrix_chunked, the inner loop iterates over matrix rows first, and queries second. Because it jumps between different query accumulators on every iteration
-                // it breaks the CPU's branch predictor (the fast-reject min_threshold limit changes dynamically per iteration) and thrashes the L1 cache.
-                // To improve, we swap the loop to evaluate one query against the entire L2 matrix chunk sequentially.
                 |mut accumulators, (chunk_idx, chunk)| {
                     let row_offset = chunk_idx * rows_per_chunk;
-                    // SWAP: Iterate queries first, matrix rows second
                     for (query_idx, acc) in accumulators.iter_mut().enumerate() {
                         let qstart = query_idx * self.dims;
                         let query = &queries[qstart..qstart + self.dims];
+                        let mut threshold = acc.min_threshold;
                         for (local_row, row) in chunk.chunks_exact(self.dims).enumerate() {
-                            let global_row = row_offset + local_row;
-                            acc.push(global_row, dot_product(row, query));
+                            let score = dot_product(row, query);
+                            if score > threshold {
+                                acc.push_slow(row_offset + local_row, score);
+                                threshold = acc.min_threshold;
+                            }
                         }
                     }
                     accumulators
@@ -416,23 +417,50 @@ impl CpuIndex {
         hasher.finish()
     }
 
-    /// Prefilter with the IVF index, then rerank candidates using per-cluster
-    /// BLAS sgemv on the already-contiguous cluster data (zero-copy).
+    /// Prefilter with the IVF index, then rerank candidates.
     ///
-    /// UPDATE: Because ANN candidate sets are inherently tiny (typically 5–200 vectors), dynamically allocating a brand-new Array1 output buffer and jumping through dispatch layers
-    /// is massively slower than executing zero-allocation simsimd inner loop. We drop ndarray and strictly use our continuous inner loops.
+    /// Uses ndarray sgemv (dispatching to BLAS/AMX) for clusters with enough rows,
+    /// falling back to simsimd dot products for small clusters.
     fn search_approx(&self, query: &[f32], k: usize, approx_index: &ApproxIndex) -> Vec<Neighbor> {
+        use ndarray::{ArrayView1, ArrayView2};
+
         let clusters = approx_index.candidate_clusters(query, k);
-        let mut accumulator = TopKAccumulator::new(k);
+        let query_view =
+            ArrayView1::from_shape(self.dims, query).expect("query shape valid");
+        let mut acc = TopKAccumulator::new(k);
+        let mut threshold = acc.min_threshold;
+
         for (row_data, indices) in clusters {
-            for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
-                accumulator.push(indices[local_row], dot_product(row, query));
+            let n_rows = indices.len();
+            if n_rows == 0 {
+                continue;
+            }
+            if n_rows >= 4 && self.dims >= 8 {
+                let matrix_view =
+                    ArrayView2::from_shape((n_rows, self.dims), row_data).expect("cluster shape valid");
+                let scores = matrix_view.dot(&query_view);
+                for (local_row, &score) in
+                    scores.as_slice().expect("contiguous").iter().enumerate()
+                {
+                    if score > threshold {
+                        acc.push_slow(indices[local_row], score);
+                        threshold = acc.min_threshold;
+                    }
+                }
+            } else {
+                for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
+                    let score = dot_product(row, query);
+                    if score > threshold {
+                        acc.push_slow(indices[local_row], score);
+                        threshold = acc.min_threshold;
+                    }
+                }
             }
         }
-        accumulator.into_sorted_vec()
+        acc.into_sorted_vec()
     }
 
-    /// Batch IVF prefilter + zero-allocation exact rerank.
+    /// Batch IVF prefilter + rerank with AMX for large clusters.
     fn search_batch_approx(
         &self,
         queries: &[f32],
@@ -440,23 +468,52 @@ impl CpuIndex {
         k: usize,
         approx_index: &ApproxIndex,
     ) -> Vec<Vec<Neighbor>> {
+        use ndarray::{ArrayView1, ArrayView2};
+
         let query_values = &queries[..query_rows * self.dims];
         let cluster_sets = approx_index.candidate_clusters_batch(query_values, query_rows, k);
+        let dims = self.dims;
 
         cluster_sets
             .into_par_iter()
             .enumerate()
             .map(|(query_idx, clusters)| {
-                let query = &query_values[query_idx * self.dims..(query_idx + 1) * self.dims];
-                let mut accumulator = TopKAccumulator::new(k);
+                let query = &query_values[query_idx * dims..(query_idx + 1) * dims];
+                let query_view =
+                    ArrayView1::from_shape(dims, query).expect("query shape valid");
+                let mut acc = TopKAccumulator::new(k);
+                let mut threshold = acc.min_threshold;
 
                 for (row_data, indices) in clusters {
-                    for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
-                        accumulator.push(indices[local_row], dot_product(row, query));
+                    let n_rows = indices.len();
+                    if n_rows == 0 {
+                        continue;
+                    }
+                    if n_rows >= 4 && dims >= 8 {
+                        let matrix_view =
+                            ArrayView2::from_shape((n_rows, dims), row_data)
+                                .expect("cluster shape valid");
+                        let scores = matrix_view.dot(&query_view);
+                        for (local_row, &score) in
+                            scores.as_slice().expect("contiguous").iter().enumerate()
+                        {
+                            if score > threshold {
+                                acc.push_slow(indices[local_row], score);
+                                threshold = acc.min_threshold;
+                            }
+                        }
+                    } else {
+                        for (local_row, row) in row_data.chunks_exact(dims).enumerate() {
+                            let score = dot_product(row, query);
+                            if score > threshold {
+                                acc.push_slow(indices[local_row], score);
+                                threshold = acc.min_threshold;
+                            }
+                        }
                     }
                 }
 
-                accumulator.into_sorted_vec()
+                acc.into_sorted_vec()
             })
             .collect()
     }
@@ -620,11 +677,37 @@ fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
 
 /// Scalar dot product with 8-wide manual unrolling to reduce loop overhead on short vectors.
 ///
-/// UPDATE: dot_unrolled_8 acts as a scalar fallback when simsimd isn't available. The loop condition while idx + 8 <= lhs.len() safely protects lhs, but LLVM cannot prove rhs has the same length
-/// so the compiler forces boundary branch checks for every rhs[idx + N] access. Let LLVM effortlessly AVX-autovectorize it safely with zip:
+/// Uses 8 independent accumulators to enable instruction-level parallelism (ILP).
+/// The length assertion lets LLVM elide bounds checks on rhs indexing.
 #[inline]
 fn dot_unrolled_8(lhs: &[f32], rhs: &[f32]) -> f32 {
-    lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).sum()
+    let len = lhs.len().min(rhs.len());
+    let lhs = &lhs[..len];
+    let rhs = &rhs[..len];
+
+    let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let (mut s4, mut s5, mut s6, mut s7) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+
+    let mut idx = 0;
+    while idx + 8 <= len {
+        s0 += lhs[idx] * rhs[idx];
+        s1 += lhs[idx + 1] * rhs[idx + 1];
+        s2 += lhs[idx + 2] * rhs[idx + 2];
+        s3 += lhs[idx + 3] * rhs[idx + 3];
+        s4 += lhs[idx + 4] * rhs[idx + 4];
+        s5 += lhs[idx + 5] * rhs[idx + 5];
+        s6 += lhs[idx + 6] * rhs[idx + 6];
+        s7 += lhs[idx + 7] * rhs[idx + 7];
+        idx += 8;
+    }
+
+    // Tail: handle remaining elements
+    while idx < len {
+        s0 += lhs[idx] * rhs[idx];
+        idx += 1;
+    }
+
+    (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7)
 }
 
 /// Minimum row count before parallelism becomes worthwhile, based on dimension count.
