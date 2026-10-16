@@ -6,11 +6,11 @@ A high-performance Rust library with Python bindings for nearest-neighbor vector
 
 Features:
 
-- CPU backend using [rayon](https://crates.io/crates/rayon) parallelism + SIMD (via [simsimd](https://crates.io/crates/simsimd)), along with highly bespoke compute profiles for maximum CPU performance
+- CPU backend using [rayon](https://crates.io/crates/rayon) parallelism + SIMD (via [simsimd](https://crates.io/crates/simsimd)) + macOS Accelerate BLAS/AMX, along with shape-aware compute profiles for maximum CPU performance
 - GPU backend using [wgpu](https://crates.io/crates/wgpu) compute shaders, supporting Vulkan, Metal, D3D12, and OpenGL graphics APIs
-- Approximate nearest-neighbor (ANN) mode with exact reranking by building an IVF index for even faster lookups
+- Approximate nearest-neighbor (ANN) mode with exact reranking by building a cluster-contiguous IVF index for faster lookups
 - Batch search for multiple queries at once
-- Python bindings via PyO3 with [numpy](https://numpy.org), [pandas](https://pandas.pydata.org), and [polars](https://pola.rs) support
+- Thread-safe Python bindings via PyO3 (releases the GIL during index construction and search) with [numpy](https://numpy.org), [pandas](https://pandas.pydata.org), and [polars](https://pola.rs) support and PEP 561 type stubs
 - Load embeddings directly from `.npy`, `.npz`, and `.parquet` files
 - Internal query-result caching for repeated searches
 
@@ -70,7 +70,7 @@ print(scores)   # [0.360 0.353 0.335 0.332 0.323]
 
 ### Batch Query
 
-Pass a 2D array to search multiple queries at once more efficienctly than querying one at a time. Returns 2D numpy arrays.
+Pass a 2D array to search multiple queries at once more efficiently than querying one at a time. Returns 2D numpy arrays.
 
 ```python
 queries = rng.normal(size=(4, dims)).astype(np.float32)
@@ -93,11 +93,15 @@ indices, scores = index_ann.search(query, k=5)
 ### Backend Selection
 
 ```python
+from nndex import NNdex, list_gpu_devices
+
 # CPU (default)
 cpu_index = NNdex(matrix, backend="cpu")
 
-# Force GPU
-gpu_index = NNdex(matrix, backend="gpu")
+# Inspect available GPU adapters and select a specific device
+print(list_gpu_devices())
+gpu_index = NNdex(matrix, backend="gpu", gpu_device_index=0)
+print(gpu_index.gpu_info())
 ```
 
 ### Pre-Normalized Data
@@ -111,7 +115,7 @@ index = NNdex(normalized_matrix, normalized=True)
 
 ### DataFrame Output
 
-A conveience function which allows you to pass a pandas or polars DataFrame to `dataframe=` to get results as DataFrames with a `similarity` column appended. The DataFrame must have the same number of rows as the index.
+A convenience function which allows you to pass a pandas or polars DataFrame to `dataframe=` to get results as DataFrames with a `similarity` column appended. The DataFrame must have the same number of rows as the index.
 
 ```python
 import pandas as pd
@@ -180,11 +184,28 @@ fn main() -> Result<(), nndex::NNdexError> {
 }
 ```
 
+## Semantic Code Search CLI (`cli/`)
+
+The repository includes a standalone `nndex-cli` package in `cli/` for semantic code search using AST-aware chunking (Python `ast` + definition-boundary splitting for Rust, JS, TS) and embeddings via either local MLX (`heylookitsanllm`) or an OpenAI-compatible HTTP `/v1/embeddings` endpoint:
+
+```bash
+cd cli
+uv run nndex embed /path/to/repo --http-url http://localhost:8080
+uv run nndex search "nearest neighbor heap accumulation" --dir /path/to/repo -k 5
+```
+
 ## Benchmarks
 
-[BENCHMARK IMAGES TO BE ADDED]
+Rust Criterion benchmarks (`benches/fit.rs`, `benches/predict.rs`, `benches/batch.rs`) and end-to-end Python benchmarks (`python_benchmarks/fit.py`, `python_benchmarks/predict.py`, `python_benchmarks/batch_predict.py`) are included in the repository:
 
-Rough Python benchmarks are available in [ANN vs. Exact](notebooks/benchmark_cpu_ann_vs_exact.ipynb) and [vs. numpy](notebooks/benchmark_cpu_vs_numpy.ipynb) Jupyter Notebooks.
+```bash
+cargo bench --features blas-accelerate --bench predict
+cargo bench --features blas-accelerate --bench batch
+uv run python -m python_benchmarks.predict
+uv run python -m python_benchmarks.batch_predict
+```
+
+Interactive Python notebooks are also available in [ANN vs. Exact](notebooks/benchmark_cpu_ann_vs_exact.ipynb) and [vs. numpy](notebooks/benchmark_cpu_vs_numpy.ipynb).
 
 ## Notes
 
@@ -198,24 +219,26 @@ Rough Python benchmarks are available in [ANN vs. Exact](notebooks/benchmark_cpu
 
 #### `NNdex(data, ...)`
 
-| Parameter      | Type       | Default  | Description                                              |
-| -------------- | ---------- | -------- | -------------------------------------------------------- |
-| `data`         | array-like | required | 2D numpy array, list, or pandas/polars DataFrame         |
-| `normalized`   | bool       | `False`  | Skip internal normalization if data is already unit-norm |
-| `approx`       | bool       | `False`  | Enable ANN prefiltering with exact reranking             |
-| `backend`      | str        | `"cpu"`  | `"cpu"` or `"gpu"`                                       |
-| `enable_cache` | bool       | `True`   | Cache repeated query results                             |
+| Parameter          | Type       | Default  | Description                                              |
+| ------------------ | ---------- | -------- | -------------------------------------------------------- |
+| `data`             | array-like | required | 2D numpy array, list, or pandas/polars DataFrame         |
+| `normalized`       | bool       | `False`  | Skip internal normalization if data is already unit-norm |
+| `approx`           | bool       | `False`  | Enable ANN prefiltering with exact reranking             |
+| `backend`          | str        | `"cpu"`  | `"cpu"` or `"gpu"`                                       |
+| `enable_cache`     | bool       | `True`   | Cache repeated query results                             |
+| `gpu_device_index` | int/None   | `None`   | Explicit GPU adapter index from `list_gpu_devices()`     |
 
 #### `NNdex.from_file(path, ...)`
 
-| Parameter      | Type     | Default  | Description                                              |
-| -------------- | -------- | -------- | -------------------------------------------------------- |
-| `path`         | str      | required | Path to `.npy`, `.npz`, or `.parquet` file               |
-| `key`          | str/None | `None`   | Array key (`.npz`) or column name (`.parquet`)           |
-| `normalized`   | bool     | `False`  | Skip internal normalization if data is already unit-norm |
-| `approx`       | bool     | `False`  | Enable ANN prefiltering with exact reranking             |
-| `backend`      | str      | `"cpu"`  | `"cpu"` or `"gpu"`                                       |
-| `enable_cache` | bool     | `True`   | Cache repeated query results                             |
+| Parameter          | Type     | Default  | Description                                              |
+| ------------------ | -------- | -------- | -------------------------------------------------------- |
+| `path`             | str      | required | Path to `.npy`, `.npz`, or `.parquet` file               |
+| `key`              | str/None | `None`   | Array key (`.npz`) or column name (`.parquet`)           |
+| `normalized`       | bool     | `False`  | Skip internal normalization if data is already unit-norm |
+| `approx`           | bool     | `False`  | Enable ANN prefiltering with exact reranking             |
+| `backend`          | str      | `"cpu"`  | `"cpu"` or `"gpu"`                                       |
+| `enable_cache`     | bool     | `True`   | Cache repeated query results                             |
+| `gpu_device_index` | int/None | `None`   | Explicit GPU adapter index from `list_gpu_devices()`     |
 
 #### `index.search(query, k=10, dataframe=None)`
 
@@ -226,6 +249,14 @@ Rough Python benchmarks are available in [ANN vs. Exact](notebooks/benchmark_cpu
 | `dataframe` | DataFrame/None | `None`   | Source DataFrame for output; must match index row count |
 
 **Returns:** Without `dataframe`: tuple of `(indices, similarities)` as numpy arrays (1D for single query, 2D for batch). With `dataframe`: a DataFrame (single query) or list of DataFrames (batch) with a `similarity` column.
+
+#### `index.gpu_info()`
+
+Returns a dict with keys `index`, `name`, `backend`, `device_type`, and `driver` when the active backend is `"gpu"`, or `None` when using `"cpu"`.
+
+#### `list_gpu_devices()`
+
+Returns a list of dicts describing all available GPU adapters (`index`, `name`, `backend`, `device_type`, `driver`).
 
 #### Properties
 
@@ -249,14 +280,19 @@ Returns top-k neighbors sorted by descending cosine similarity.
 
 Batch search over multiple query vectors.
 
+#### `index.gpu_info() -> Option<GpuDeviceInfo>` / `list_gpu_devices() -> Vec<GpuDeviceInfo>`
+
+Inspect the active GPU adapter or list all available `wgpu` adapters (requires `gpu` feature).
+
 #### `IndexOptions`
 
-| Field          | Type                | Default | Description                                |
-| -------------- | ------------------- | ------- | ------------------------------------------ |
-| `normalized`   | `bool`              | `false` | Skip normalization for pre-normalized data |
-| `approx`       | `bool`              | `false` | Enable ANN prefiltering                    |
-| `backend`      | `BackendPreference` | `Cpu`   | `Cpu`, or `Gpu`                            |
-| `enable_cache` | `bool`              | `true`  | Cache constructor and query results        |
+| Field              | Type                | Default | Description                                          |
+| ------------------ | ------------------- | ------- | ---------------------------------------------------- |
+| `normalized`       | `bool`              | `false` | Skip normalization for pre-normalized data           |
+| `approx`           | `bool`              | `false` | Enable ANN prefiltering                              |
+| `backend`          | `BackendPreference` | `Cpu`   | `Cpu` or `Gpu`                                       |
+| `enable_cache`     | `bool`              | `true`  | Cache constructor and query results                  |
+| `gpu_device_index` | `Option<usize>`     | `None`  | Explicit GPU adapter index from `list_gpu_devices()` |
 
 ## Maintainer/Creator
 
