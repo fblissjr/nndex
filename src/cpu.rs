@@ -6,7 +6,9 @@ use rayon::prelude::*;
 use simsimd::SpatialSimilarity;
 
 use crate::approx::ApproxIndex;
-use crate::profiles::{CachePolicy, CpuBatchStrategy, CpuSearchStrategy, TuningProfile};
+use crate::profiles::{
+    BoundedLruCache, CachePolicy, CpuBatchStrategy, CpuSearchStrategy, TuningProfile,
+};
 use crate::topk::{Neighbor, TopKAccumulator, topk_from_scores};
 
 /// Maximum rows for the parallel-scores strategy (scores vector <= 1 MB).
@@ -18,59 +20,6 @@ const SINGLE_QUERY_CACHE_CAPACITY: usize = 64;
 
 /// Maximum entries retained in the batch-query LRU result cache.
 const BATCH_QUERY_CACHE_CAPACITY: usize = 8;
-
-/// Fixed-capacity LRU cache keyed by `u64` hashes.
-///
-/// Uses a `Vec` with most-recently-used items at the front. The small capacity
-/// (typically <= 128) keeps linear scans fast while avoiding a heap-heavy `HashMap`.
-#[derive(Debug)]
-struct BoundedLruCache<T> {
-    entries: Vec<(u64, T)>,
-    capacity: usize,
-}
-
-impl<T> BoundedLruCache<T> {
-    /// Create an empty cache with the given maximum number of entries.
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    /// Insert or update an entry, promoting it to most-recently-used. Evicts the
-    /// least-recently-used entry when at capacity.
-    fn insert(&mut self, key: u64, value: T) {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|(stored_key, _)| *stored_key == key)
-        {
-            self.entries[index] = (key, value);
-            self.entries.swap(0, index);
-            return;
-        }
-
-        if self.entries.len() == self.capacity {
-            let _ = self.entries.pop();
-        }
-        self.entries.push((key, value));
-        let tail = self.entries.len().saturating_sub(1);
-        self.entries.swap(0, tail);
-    }
-}
-
-impl<T: Clone> BoundedLruCache<T> {
-    /// Look up an entry by key, cloning the value and promoting it to most-recently-used.
-    fn get_cloned(&mut self, key: u64) -> Option<T> {
-        let index = self
-            .entries
-            .iter()
-            .position(|(stored_key, _)| *stored_key == key)?;
-        self.entries.swap(0, index);
-        Some(self.entries[0].1.clone())
-    }
-}
 
 /// Shared mutable state for caching approximate search results.
 #[derive(Debug)]
@@ -164,6 +113,7 @@ impl CpuIndex {
         k: usize,
         approx: bool,
     ) -> Vec<Vec<Neighbor>> {
+        initialize_simd_runtime();
         let batch_profile =
             TuningProfile::for_shape(self.rows, self.dims, query_rows, self.profile.cache_policy);
         let capped_k = k.min(self.rows);
@@ -395,9 +345,9 @@ impl CpuIndex {
             .collect()
     }
 
-    /// Returns the ANN prefilter index only if it actually reduces dimensionality.
-    /// When `sample_dims == dims`, the prefilter does the same work as exact search
-    /// with extra overhead, so we return `None` to fall through to exact search.
+    /// Returns the IVF prefilter index only if it provides a speedup (`nlist >= 4`).
+    /// For small row counts (`rows < MIN_ROWS_FOR_IVF`), `provides_speedup()` returns `false`
+    /// and we return `None` to fall through to exact search.
     #[inline]
     fn approx_index(&self) -> Option<&ApproxIndex> {
         self.approx_index.as_ref().and_then(|index| {
@@ -740,13 +690,17 @@ mod tests {
 
     #[test]
     fn lru_cache_evicts_least_recently_used() {
-        let mut cache = BoundedLruCache::with_capacity(2);
+        let mut cache = BoundedLruCache::with_capacity(3);
         cache.insert(1, "a");
         cache.insert(2, "b");
         cache.insert(3, "c");
+        cache.insert(4, "d");
 
+        assert_eq!(cache.get_cloned(1), None);
+        assert_eq!(cache.get_cloned(2), Some("b"));
         assert_eq!(cache.get_cloned(3), Some("c"));
-        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.get_cloned(4), Some("d"));
+        assert_eq!(cache.entries.len(), 3);
     }
 
     #[test]
@@ -771,6 +725,9 @@ mod tests {
         cache.insert(4, "d");
 
         assert_eq!(cache.get_cloned(1), Some("a"));
+        assert_eq!(cache.get_cloned(2), None);
+        assert_eq!(cache.get_cloned(3), Some("c"));
+        assert_eq!(cache.get_cloned(4), Some("d"));
     }
 
     // ---- dot_product / dot_unrolled_8 ----

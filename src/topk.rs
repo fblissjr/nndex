@@ -12,8 +12,9 @@ pub struct Neighbor {
 
 /// Internal heap entry pairing a row index with its similarity score.
 ///
-/// Ordering is by similarity (ascending) with ties broken by index, so a min-heap
-/// of `Reverse<HeapItem>` naturally surfaces the smallest score for eviction.
+/// Ordering is by similarity (ascending) with ties broken by descending index, so a min-heap
+/// of `Reverse<HeapItem>` naturally surfaces the smallest score (and highest index on ties)
+/// for eviction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HeapItem {
     index: usize,
@@ -26,7 +27,7 @@ impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.similarity
             .total_cmp(&other.similarity)
-            .then_with(|| self.index.cmp(&other.index))
+            .then_with(|| other.index.cmp(&self.index))
     }
 }
 
@@ -62,10 +63,8 @@ impl TopKAccumulator {
 
     /// Consider a candidate neighbor, inserting it only if it belongs in the top-k.
     ///
-    /// UPDATE: Fast-path: O(1) reject handles 99.9% of iterations inline
-    /// When performing batch search using GEMM, topk_from_scores iterates over the entire dense score matrix and calls .collect() to build a Vec<(usize, f32)> for select_nth_unstable_by.
-    /// For an index with 10,000,000 rows this allocates an 80MB Vec per query. Stream scores directly into the TopKAccumulator. By adding an #[inline(always)] fast-reject branch, the CPU handles 99.9% of iterations
-    /// natively in registers—allowing.
+    /// Uses an inline O(1) fast-reject against `min_threshold` so the CPU handles >99.9%
+    /// of iterations in registers without calling into the heap manipulation path.
     #[inline(always)]
     pub(crate) fn push(&mut self, index: usize, similarity: f32) {
         if similarity <= self.min_threshold {
@@ -278,6 +277,21 @@ mod tests {
         assert_eq!(result[0].index, 2);
         assert_eq!(result[1].index, 5);
         assert_eq!(result[2].index, 8);
+    }
+
+    #[test]
+    fn ties_at_cutoff_evict_higher_index_and_match_topk_from_scores() {
+        let scores = [0.5, 0.5, 0.9];
+        let mut acc = TopKAccumulator::new(2);
+        for (idx, &score) in scores.iter().enumerate() {
+            acc.push(idx, score);
+        }
+
+        let from_acc = acc.into_sorted_vec();
+        let from_quickselect = topk_from_scores(&scores, 2, 0);
+        assert_eq!(from_acc, from_quickselect);
+        assert_eq!(from_acc[0].index, 2);
+        assert_eq!(from_acc[1].index, 0);
     }
 
     #[test]

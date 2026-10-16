@@ -287,6 +287,50 @@ class TestASTChunking:
             matching = [c for c in chunks if pattern in c.content]
             assert len(matching) == 1, f"'{pattern}' in {len(matching)} chunks"
 
+    def test_ast_chunk_line_numbers_preserve_true_file_lines(self, tmp_path):
+        """Line numbers in AST chunks should reflect true 1-based file lines even with blank lines."""
+        from nndex_cli.chunker import chunk_file
+
+        py_file = tmp_path / "spaced.py"
+        py_file.write_text(
+            "import os\n"               # line 1
+            "\n"                        # line 2
+            "\n"                        # line 3
+            "def first():\n"            # line 4
+            "    return 1\n"            # line 5
+            "\n"                        # line 6
+            "\n"                        # line 7
+            "\n"                        # line 8
+            "def second():\n"           # line 9
+            "    return 2\n"            # line 10
+            "\n"                        # line 11
+            "\n"                        # line 12
+            "def third():\n"            # line 13
+            "    return 'x' * 100\n"    # line 14
+        )
+        chunks = chunk_file(py_file, max_chars=80)
+        assert len(chunks) >= 2
+        # First chunk has import os (line 1), first() (lines 4-5), second() (lines 9-10)
+        assert chunks[0].start_line == 1
+        assert chunks[0].end_line == 10
+        assert chunks[-1].start_line == 13
+        assert chunks[-1].end_line == 14
+
+    def test_oversized_single_definition_is_subchunked(self, tmp_path):
+        """A single function exceeding max_chars should be split into smaller sub-chunks."""
+        from nndex_cli.chunker import chunk_file
+
+        py_file = tmp_path / "giant.py"
+        body = "\n".join(f"    step_{i} = {i}" for i in range(40))
+        py_file.write_text(f"def giant():\n{body}\n    return 0\n")
+
+        chunks = chunk_file(py_file, max_chars=200, overlap_lines=2)
+        assert len(chunks) > 1
+        assert chunks[0].start_line == 1
+        assert chunks[-1].end_line == 42
+        for c in chunks:
+            assert len(c.content) <= 200
+
 
 class TestChunkDirectory:
     """Test chunking all files in a directory."""

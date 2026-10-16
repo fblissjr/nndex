@@ -205,11 +205,13 @@ def _chunk_by_definitions(
     file_path: str,
     boundaries: List[int],
     max_chars: int,
+    overlap_lines: int = 5,
 ) -> List[Chunk]:
     """Split file into chunks aligned to definition boundaries.
 
     Groups consecutive definitions until adding the next one would
-    exceed max_chars, then starts a new chunk. No overlap between chunks.
+    exceed max_chars, then starts a new chunk. Definitions that individually
+    exceed max_chars are sub-chunked using a line-based sliding window.
     """
     if not boundaries:
         return []
@@ -227,59 +229,91 @@ def _chunk_by_definitions(
 
     # Preamble: lines before first definition (imports, comments, etc.)
     preamble_end = boundaries[0] - 1
-    preamble = "\n".join(lines[:preamble_end]).rstrip()
+    preamble_actual_end = preamble_end
+    while preamble_actual_end > 0 and not lines[preamble_actual_end - 1].strip():
+        preamble_actual_end -= 1
+    preamble = "\n".join(lines[:preamble_actual_end]).rstrip()
 
-    chunks = []
+    chunks: List[Chunk] = []
     current_lines_start = 0  # 0-based start of current chunk
-    current_parts = []
+    current_lines_end = 0    # 0-based exclusive end of current chunk
+    current_parts: List[str] = []
     current_chars = 0
+
+    def _flush_current() -> None:
+        nonlocal current_parts, current_chars
+        if not current_parts:
+            return
+        content = "\n".join(current_parts)
+        preview = content[:100].replace("\n", " ").strip()
+        chunks.append(Chunk(
+            file_path=file_path,
+            start_line=current_lines_start + 1,
+            end_line=max(current_lines_start + 1, current_lines_end),
+            content=content,
+            preview=preview,
+        ))
+        current_parts = []
+        current_chars = 0
 
     if preamble:
         current_parts.append(preamble)
         current_chars = len(preamble)
         current_lines_start = 0
+        current_lines_end = preamble_actual_end
 
     for seg_start, seg_end in segments:
-        segment_text = "\n".join(lines[seg_start:seg_end]).rstrip()
+        seg_actual_end = seg_end
+        while seg_actual_end > seg_start and not lines[seg_actual_end - 1].strip():
+            seg_actual_end -= 1
+        if seg_actual_end == seg_start:
+            seg_actual_end = seg_end
+
+        segment_text = "\n".join(lines[seg_start:seg_actual_end]).rstrip()
         segment_chars = len(segment_text)
 
-        # If adding this segment would exceed max_chars and we already have content
+        # If adding this segment would exceed max_chars and we already have content, flush first
         if current_parts and current_chars + segment_chars + 1 > max_chars:
-            # Flush current chunk
-            content = "\n".join(current_parts)
-            # Recalculate actual line range from content
-            chunk_line_count = content.count("\n") + 1
-            preview = content[:100].replace("\n", " ").strip()
-            chunks.append(Chunk(
-                file_path=file_path,
-                start_line=current_lines_start + 1,
-                end_line=current_lines_start + chunk_line_count,
-                content=content,
-                preview=preview,
-            ))
-            # Start new chunk
-            current_parts = [segment_text]
-            current_chars = segment_chars
+            _flush_current()
+
+        # If this single definition alone exceeds max_chars, sub-chunk its lines
+        if segment_chars > max_chars:
+            seg_lines = lines[seg_start:seg_actual_end]
+            sub_i = 0
+            while sub_i < len(seg_lines):
+                sub_chunk_lines: List[str] = []
+                char_count = 0
+                sub_j = sub_i
+                while sub_j < len(seg_lines):
+                    line_len = len(seg_lines[sub_j]) + (1 if sub_chunk_lines else 0)
+                    if sub_chunk_lines and char_count + line_len > max_chars:
+                        break
+                    sub_chunk_lines.append(seg_lines[sub_j])
+                    char_count += line_len
+                    sub_j += 1
+
+                content = "\n".join(sub_chunk_lines)
+                preview = content[:100].replace("\n", " ").strip()
+                chunks.append(Chunk(
+                    file_path=file_path,
+                    start_line=seg_start + sub_i + 1,
+                    end_line=seg_start + sub_i + len(sub_chunk_lines),
+                    content=content,
+                    preview=preview,
+                ))
+                advance = max(1, len(sub_chunk_lines) - overlap_lines)
+                sub_i += advance
+                if sub_j >= len(seg_lines):
+                    break
+            continue
+
+        if not current_parts:
             current_lines_start = seg_start
-        else:
-            if not current_parts:
-                current_lines_start = seg_start if not preamble else 0
-            current_parts.append(segment_text)
-            current_chars += segment_chars + 1
+        current_parts.append(segment_text)
+        current_chars += segment_chars + (1 if len(current_parts) > 1 else 0)
+        current_lines_end = seg_actual_end
 
-    # Flush remaining
-    if current_parts:
-        content = "\n".join(current_parts)
-        chunk_line_count = content.count("\n") + 1
-        preview = content[:100].replace("\n", " ").strip()
-        chunks.append(Chunk(
-            file_path=file_path,
-            start_line=current_lines_start + 1,
-            end_line=current_lines_start + chunk_line_count,
-            content=content,
-            preview=preview,
-        ))
-
+    _flush_current()
     return chunks
 
 
@@ -328,7 +362,9 @@ def chunk_file(
     suffix = path.suffix.lower()
     boundaries = _get_definition_boundaries(text, suffix)
     if boundaries:
-        ast_chunks = _chunk_by_definitions(lines, file_path, boundaries, max_chars)
+        ast_chunks = _chunk_by_definitions(
+            lines, file_path, boundaries, max_chars, overlap_lines=overlap_lines
+        )
         if ast_chunks:
             return ast_chunks
 

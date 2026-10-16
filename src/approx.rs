@@ -108,7 +108,7 @@ impl ApproxIndex {
     ///
     /// * `query` - Query vector with length `dims`.
     /// * `k` - Number of final neighbors requested (used to tune nprobe).
-    #[cfg(any(feature = "gpu", test))]
+    #[cfg(test)]
     pub(crate) fn candidate_indices(&self, query: &[f32], k: usize) -> Vec<usize> {
         debug_assert_eq!(query.len(), self.dims);
 
@@ -142,6 +142,8 @@ impl ApproxIndex {
     ///
     /// Instead of returning scattered indices, returns contiguous slices from the
     /// reordered matrix that can be scored with sequential memory access.
+    /// Uses ndarray sgemv (BLAS/AMX) for centroid scoring when `nlist` and `dims` are
+    /// large enough to benefit, falling back to the scalar `dot_small` loop otherwise.
     ///
     /// # Arguments
     ///
@@ -151,11 +153,6 @@ impl ApproxIndex {
     /// # Returns
     ///
     /// Vector of `(cluster_row_data_slice, original_indices_slice)` per probed cluster.
-    ///
-    /// Return candidate data for a single query: contiguous row data + original indices.
-    ///
-    /// Uses ndarray sgemv (BLAS/AMX) for centroid scoring when nlist and dims are
-    /// large enough to benefit, falling back to the scalar dot_small loop otherwise.
     pub(crate) fn candidate_clusters(&self, query: &[f32], k: usize) -> Vec<(&[f32], &[usize])> {
         debug_assert_eq!(query.len(), self.dims);
 
@@ -370,15 +367,49 @@ fn kmeans_plusplus_init(matrix: &[f32], rows: usize, dims: usize, nlist: usize) 
     for c in 1..nlist {
         let last_centroid = &centroids[(c - 1) * dims..c * dims];
 
-        let mut total_dist = 0.0_f64;
-        for (row_idx, min_dist) in min_dists.iter_mut().enumerate() {
-            let row = &matrix[row_idx * dims..(row_idx + 1) * dims];
-            let dist = (1.0 - dot_small(row, last_centroid)).max(0.0);
-            if dist < *min_dist {
-                *min_dist = dist;
+        #[cfg(feature = "cpu")]
+        let total_dist = if rows >= 4_096 {
+            min_dists
+                .par_chunks_mut(1024)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let row_offset = chunk_idx * 1024;
+                    for (local_i, min_dist) in chunk.iter_mut().enumerate() {
+                        let row_idx = row_offset + local_i;
+                        let row = &matrix[row_idx * dims..(row_idx + 1) * dims];
+                        let dist = (1.0 - dot_small(row, last_centroid)).max(0.0);
+                        if dist < *min_dist {
+                            *min_dist = dist;
+                        }
+                    }
+                });
+            min_dists.iter().map(|&d| d as f64).sum::<f64>()
+        } else {
+            let mut sum = 0.0_f64;
+            for (row_idx, min_dist) in min_dists.iter_mut().enumerate() {
+                let row = &matrix[row_idx * dims..(row_idx + 1) * dims];
+                let dist = (1.0 - dot_small(row, last_centroid)).max(0.0);
+                if dist < *min_dist {
+                    *min_dist = dist;
+                }
+                sum += *min_dist as f64;
             }
-            total_dist += *min_dist as f64;
-        }
+            sum
+        };
+
+        #[cfg(not(feature = "cpu"))]
+        let total_dist = {
+            let mut sum = 0.0_f64;
+            for (row_idx, min_dist) in min_dists.iter_mut().enumerate() {
+                let row = &matrix[row_idx * dims..(row_idx + 1) * dims];
+                let dist = (1.0 - dot_small(row, last_centroid)).max(0.0);
+                if dist < *min_dist {
+                    *min_dist = dist;
+                }
+                sum += *min_dist as f64;
+            }
+            sum
+        };
 
         if total_dist <= 0.0 {
             let dup: Vec<f32> = last_centroid.to_vec();
@@ -428,7 +459,7 @@ fn pick_medoid_row(matrix: &[f32], rows: usize, dims: usize) -> usize {
     best_idx
 }
 
-/// Run spherical k-means for a fixed number of iterations.
+/// Run spherical k-means for up to `KMEANS_MAX_ITERS` iterations, stopping early if assignments converge.
 ///
 /// Returns the final centroids and per-row cluster assignments.
 fn spherical_kmeans(
@@ -438,17 +469,20 @@ fn spherical_kmeans(
     nlist: usize,
     mut centroids: Vec<f32>,
 ) -> (Vec<f32>, Vec<usize>) {
-    let mut assignments = vec![0_usize; rows];
+    let mut assignments = vec![usize::MAX; rows];
 
     for _iter in 0..KMEANS_MAX_ITERS {
         #[cfg(feature = "cpu")]
-        {
+        let changed = {
+            use std::sync::atomic::{AtomicBool, Ordering};
             let centroid_ref = &centroids;
+            let any_changed = AtomicBool::new(false);
             assignments
                 .par_chunks_mut(1024)
                 .enumerate()
                 .for_each(|(chunk_idx, chunk)| {
                     let row_offset = chunk_idx * 1024;
+                    let mut chunk_changed = false;
                     for (local_i, assignment) in chunk.iter_mut().enumerate() {
                         let row_idx = row_offset + local_i;
                         if row_idx >= rows {
@@ -464,13 +498,21 @@ fn spherical_kmeans(
                                 best_cluster = c_idx;
                             }
                         }
-                        *assignment = best_cluster;
+                        if *assignment != best_cluster {
+                            *assignment = best_cluster;
+                            chunk_changed = true;
+                        }
+                    }
+                    if chunk_changed {
+                        any_changed.store(true, Ordering::Relaxed);
                     }
                 });
-        }
+            any_changed.load(Ordering::Relaxed)
+        };
 
         #[cfg(not(feature = "cpu"))]
-        {
+        let changed = {
+            let mut any_changed = false;
             for row_idx in 0..rows {
                 let row = &matrix[row_idx * dims..(row_idx + 1) * dims];
                 let mut best_cluster = 0;
@@ -482,8 +524,16 @@ fn spherical_kmeans(
                         best_cluster = c_idx;
                     }
                 }
-                assignments[row_idx] = best_cluster;
+                if assignments[row_idx] != best_cluster {
+                    assignments[row_idx] = best_cluster;
+                    any_changed = true;
+                }
             }
+            any_changed
+        };
+
+        if !changed {
+            break;
         }
 
         // Recompute centroids as mean of assigned rows, then re-normalize.

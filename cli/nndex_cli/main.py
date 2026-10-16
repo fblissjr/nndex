@@ -11,7 +11,7 @@ import numpy as np
 
 DEFAULT_MODEL_PATH = os.environ.get(
     "NNDEX_MODEL_PATH",
-    "/Users/fredbliss/Storage/google_embeddinggemma-300m",
+    str(Path.home() / "Storage" / "google_embeddinggemma-300m"),
 )
 DEFAULT_API_URL = os.environ.get("NNDEX_API_URL", "http://localhost:8000")
 
@@ -37,7 +37,7 @@ def cmd_embed(args):
     # Load embedding provider
     print(f"loading model from {model_path} ...")
     t0 = time.time()
-    provider = _load_provider(model_path)
+    provider = _load_provider_auto(model_path=model_path)
     print(f"model loaded in {time.time() - t0:.1f}s")
 
     # Embed
@@ -78,11 +78,11 @@ def cmd_search(args):
     embeddings = load_embeddings(nndex_dir)
     model_path = meta["model"]
 
-    # Build in-memory index
-    index = build_index(embeddings, normalized=True)
+    # Build in-memory index (normalize in Rust in case HTTP embeddings are unnormalized)
+    index = build_index(embeddings, normalized=False)
 
     # Load provider and embed query
-    provider = _load_provider(model_path)
+    provider = _load_provider_auto(model_path=model_path)
     query_vec = embed_query(args.query, provider)
     query_arr = np.array(query_vec, dtype=np.float32)
 

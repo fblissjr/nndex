@@ -25,6 +25,65 @@ impl CachePolicy {
     }
 }
 
+/// Fixed-capacity LRU cache keyed by `u64` hashes.
+///
+/// Uses a `Vec` with most-recently-used items at the front (`index 0`) and
+/// least-recently-used at the back. The small capacity (<= 128) keeps linear
+/// scans and slice rotations within a few cache lines while avoiding `HashMap` overhead.
+#[cfg(any(feature = "cpu", feature = "gpu"))]
+#[derive(Debug)]
+pub(crate) struct BoundedLruCache<T> {
+    pub(crate) entries: Vec<(u64, T)>,
+    capacity: usize,
+}
+
+#[cfg(any(feature = "cpu", feature = "gpu"))]
+impl<T> BoundedLruCache<T> {
+    /// Create an empty cache with the given maximum number of entries.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Insert or update an entry, promoting it to most-recently-used. Evicts the
+    /// least-recently-used entry when at capacity.
+    pub(crate) fn insert(&mut self, key: u64, value: T) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(stored_key, _)| *stored_key == key)
+        {
+            self.entries[index] = (key, value);
+            self.entries[..=index].rotate_right(1);
+            return;
+        }
+
+        if self.entries.len() == self.capacity {
+            let _ = self.entries.pop();
+        }
+        self.entries.push((key, value));
+        self.entries.rotate_right(1);
+    }
+}
+
+#[cfg(any(feature = "cpu", feature = "gpu"))]
+impl<T: Clone> BoundedLruCache<T> {
+    /// Look up an entry by key, cloning the value and promoting it to most-recently-used.
+    pub(crate) fn get_cloned(&mut self, key: u64) -> Option<T> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(stored_key, _)| *stored_key == key)?;
+        self.entries[..=index].rotate_right(1);
+        Some(self.entries[0].1.clone())
+    }
+}
+
 /// Strategy used for exact single-query CPU search, selected by [`TuningProfile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CpuSearchStrategy {

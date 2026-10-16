@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
@@ -9,7 +8,7 @@ use thiserror::Error;
 use wgpu::util::DeviceExt;
 
 use crate::approx::ApproxIndex;
-use crate::profiles::{CachePolicy, TuningProfile};
+use crate::profiles::{BoundedLruCache, CachePolicy, TuningProfile};
 use crate::topk::{Neighbor, TopKAccumulator};
 
 const WORKGROUP_SIZE: u32 = 256;
@@ -96,6 +95,7 @@ pub(crate) struct GpuIndex {
     device: wgpu::Device,
     queue: wgpu::Queue,
     adapter_info: wgpu::AdapterInfo,
+    adapter_index: usize,
     rows: usize,
     dims: usize,
     /// dims rounded up to multiple of 4 for vec4 shader access.
@@ -107,10 +107,10 @@ pub(crate) struct GpuIndex {
     profile: TuningProfile,
     host_matrix: Vec<f32>,
     approx_index: Option<OnceLock<ApproxIndex>>,
-    /// Bounded cache for single-query results keyed by query hash.
-    cached_single: Mutex<HashMap<u64, Vec<Neighbor>>>,
-    /// Bounded cache for batch-query results keyed by query hash.
-    cached_batch: Mutex<HashMap<u64, Vec<Vec<Neighbor>>>>,
+    /// Bounded LRU cache for single-query results keyed by query hash.
+    cached_single: Mutex<BoundedLruCache<Vec<Neighbor>>>,
+    /// Bounded LRU cache for batch-query results keyed by query hash.
+    cached_batch: Mutex<BoundedLruCache<Vec<Vec<Neighbor>>>>,
     /// Max queries that fit in one sub-batch before output buffer exceeds adapter limits.
     max_queries_per_sub_batch: usize,
     /// Reusable buffers for single-query exact GPU dispatch.
@@ -143,8 +143,9 @@ impl GpuIndex {
         enable_cache: bool,
         gpu_device_index: Option<usize>,
     ) -> Result<Self, GpuError> {
+        debug_assert_eq!(dims % 4, 0, "GpuIndex expects vec4-aligned dims");
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = select_adapter(&instance, gpu_device_index)?;
+        let (adapter, adapter_index) = select_adapter(&instance, gpu_device_index)?;
 
         let adapter_info = adapter.get_info();
         let requested_limits = adapter.limits();
@@ -160,7 +161,7 @@ impl GpuIndex {
         }))
         .map_err(|error| GpuError::RequestDevice(error.to_string()))?;
 
-        let dims_vec4 = dims.next_multiple_of(4);
+        let dims_vec4 = dims;
 
         let shader_lowdim = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nndex-shader-lowdim"),
@@ -244,14 +245,6 @@ impl GpuIndex {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
-        // Avoid duplicating host memory when rows are already vec4-aligned.
-        // This reduces fit-time allocation and copy overhead for common dimensions.
-        let padded_matrix = if dims == dims_vec4 {
-            Cow::Borrowed(matrix)
-        } else {
-            Cow::Owned(pad_to_vec4(matrix, rows, dims, dims_vec4))
-        };
-
         let max_binding_bytes =
             max_buffer_binding_size.max(dims_vec4.saturating_mul(std::mem::size_of::<f32>()));
         let bytes_per_row = dims_vec4.saturating_mul(std::mem::size_of::<f32>());
@@ -265,7 +258,7 @@ impl GpuIndex {
             let end = start + row_count * dims_vec4;
             let matrix_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("nndex-matrix-chunk"),
-                contents: bytemuck::cast_slice(&padded_matrix[start..end]),
+                contents: bytemuck::cast_slice(&matrix[start..end]),
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
@@ -286,6 +279,7 @@ impl GpuIndex {
             device,
             queue,
             adapter_info,
+            adapter_index,
             rows,
             dims,
             dims_vec4,
@@ -301,8 +295,8 @@ impl GpuIndex {
             ),
             host_matrix: if approx { matrix.to_vec() } else { Vec::new() },
             approx_index: approx.then(OnceLock::new),
-            cached_single: Mutex::new(HashMap::with_capacity(SINGLE_CACHE_CAPACITY)),
-            cached_batch: Mutex::new(HashMap::with_capacity(BATCH_CACHE_CAPACITY)),
+            cached_single: Mutex::new(BoundedLruCache::with_capacity(SINGLE_CACHE_CAPACITY)),
+            cached_batch: Mutex::new(BoundedLruCache::with_capacity(BATCH_CACHE_CAPACITY)),
             max_queries_per_sub_batch,
             single_query_dispatch,
         })
@@ -311,6 +305,11 @@ impl GpuIndex {
     /// Returns the adapter info captured at construction time.
     pub(crate) fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
+    }
+
+    /// Returns the adapter enumeration index captured at construction time.
+    pub(crate) fn adapter_index(&self) -> usize {
+        self.adapter_index
     }
 
     /// Search for the top-k nearest neighbors of a single query.
@@ -326,19 +325,16 @@ impl GpuIndex {
     ) -> Result<Vec<Neighbor>, GpuError> {
         if self.profile.cache_enabled() {
             let cache_key = self.query_hash(query, k, 1, approx);
-            if let Ok(guard) = self.cached_single.lock()
-                && let Some(cached) = guard.get(&cache_key)
+            if let Ok(mut guard) = self.cached_single.lock()
+                && let Some(cached) = guard.get_cloned(cache_key)
             {
-                return Ok(cached.clone());
+                return Ok(cached);
             }
 
             let capped_k = k.min(self.rows);
             let result = self.dispatch_single_or_approx(query, capped_k, approx)?;
 
             if let Ok(mut guard) = self.cached_single.lock() {
-                if guard.len() >= SINGLE_CACHE_CAPACITY {
-                    guard.clear();
-                }
                 guard.insert(cache_key, result.clone());
             }
             return Ok(result);
@@ -378,18 +374,15 @@ impl GpuIndex {
     ) -> Result<Vec<Vec<Neighbor>>, GpuError> {
         if self.profile.cache_enabled() {
             let cache_key = self.query_hash(queries, k, query_rows, approx);
-            if let Ok(guard) = self.cached_batch.lock()
-                && let Some(cached) = guard.get(&cache_key)
+            if let Ok(mut guard) = self.cached_batch.lock()
+                && let Some(cached) = guard.get_cloned(cache_key)
             {
-                return Ok(cached.clone());
+                return Ok(cached);
             }
 
             let out = self.dispatch_batch_or_approx(queries, query_rows, k, approx)?;
 
             if let Ok(mut guard) = self.cached_batch.lock() {
-                if guard.len() >= BATCH_CACHE_CAPACITY {
-                    guard.clear();
-                }
                 guard.insert(cache_key, out.clone());
             }
             return Ok(out);
@@ -410,11 +403,45 @@ impl GpuIndex {
         if approx && let Some(approx_index) = self.approx_index() {
             #[cfg(feature = "cpu")]
             {
+                use ndarray::{ArrayView1, ArrayView2};
                 use rayon::prelude::*;
-                return Ok(queries
-                    .par_chunks_exact(self.dims)
-                    .take(query_rows)
-                    .map(|query| self.search_approx_cpu(query, capped_k, approx_index))
+
+                let query_values = &queries[..query_rows * self.dims];
+                let cluster_sets =
+                    approx_index.candidate_clusters_batch(query_values, query_rows, capped_k);
+                let dims = self.dims;
+
+                return Ok(cluster_sets
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(query_idx, clusters)| {
+                        let query = &query_values[query_idx * dims..(query_idx + 1) * dims];
+                        let query_view =
+                            ArrayView1::from_shape(dims, query).expect("query shape valid");
+                        let mut accumulator = TopKAccumulator::new(capped_k);
+
+                        for (row_data, indices) in clusters {
+                            let n_rows = indices.len();
+                            if n_rows == 0 {
+                                continue;
+                            }
+                            if n_rows >= 4 && dims >= 8 {
+                                let matrix_view = ArrayView2::from_shape((n_rows, dims), row_data)
+                                    .expect("cluster shape valid");
+                                let scores = matrix_view.dot(&query_view);
+                                let scores_slice = scores.as_slice().expect("contiguous");
+                                for (local_row, &score) in scores_slice.iter().enumerate() {
+                                    accumulator.push(indices[local_row], score);
+                                }
+                            } else {
+                                for (local_row, row) in row_data.chunks_exact(dims).enumerate() {
+                                    accumulator.push(indices[local_row], cpu_dot(row, query));
+                                }
+                            }
+                        }
+
+                        accumulator.into_sorted_vec()
+                    })
                     .collect());
             }
             #[cfg(not(feature = "cpu"))]
@@ -440,9 +467,9 @@ impl GpuIndex {
         })
     }
 
-    /// Rerank ANN candidates using CPU dot products.
+    /// Rerank ANN candidates using contiguous cluster slices and BLAS/SIMD dot products.
     ///
-    /// For small candidate sets (typically <=4096 rows), CPU SIMD dot products are
+    /// For small candidate sets (typically <=4096 rows), CPU BLAS/SIMD dot products are
     /// faster than GPU dispatch overhead.
     fn search_approx_cpu(
         &self,
@@ -450,13 +477,33 @@ impl GpuIndex {
         k: usize,
         approx_index: &ApproxIndex,
     ) -> Vec<Neighbor> {
-        let candidates = approx_index.candidate_indices(query, k.min(self.rows));
-        let mut accumulator = TopKAccumulator::new(k.min(self.rows));
-        for &candidate in &candidates {
-            let start = candidate * self.dims;
-            let end = start + self.dims;
-            let row = &self.host_matrix[start..end];
-            accumulator.push(candidate, cpu_dot(row, query));
+        let capped_k = k.min(self.rows);
+        let clusters = approx_index.candidate_clusters(query, capped_k);
+        let mut accumulator = TopKAccumulator::new(capped_k);
+
+        #[cfg(feature = "cpu")]
+        let query_view =
+            ndarray::ArrayView1::from_shape(self.dims, query).expect("query shape valid");
+
+        for (row_data, indices) in clusters {
+            let n_rows = indices.len();
+            if n_rows == 0 {
+                continue;
+            }
+            #[cfg(feature = "cpu")]
+            if n_rows >= 4 && self.dims >= 8 {
+                let matrix_view = ndarray::ArrayView2::from_shape((n_rows, self.dims), row_data)
+                    .expect("cluster shape valid");
+                let scores = matrix_view.dot(&query_view);
+                let scores_slice = scores.as_slice().expect("contiguous");
+                for (local_row, &score) in scores_slice.iter().enumerate() {
+                    accumulator.push(indices[local_row], score);
+                }
+                continue;
+            }
+            for (local_row, row) in row_data.chunks_exact(self.dims).enumerate() {
+                accumulator.push(indices[local_row], cpu_dot(row, query));
+            }
         }
         accumulator.into_sorted_vec()
     }
@@ -484,11 +531,7 @@ impl GpuIndex {
 
     /// Execute an exact GPU search for a single query, using reusable buffers when available.
     fn search_exact_single(&self, query: &[f32], k: usize) -> Result<Vec<Neighbor>, GpuError> {
-        let padded_query = if self.dims == self.dims_vec4 {
-            Cow::Borrowed(query)
-        } else {
-            Cow::Owned(pad_query_vec4(query, self.dims, self.dims_vec4))
-        };
+        debug_assert_eq!(self.dims, self.dims_vec4);
         if let Some(reused_dispatch) = &self.single_query_dispatch {
             let dispatch = reused_dispatch.get_or_init(|| {
                 Mutex::new(build_single_query_dispatch(
@@ -498,9 +541,9 @@ impl GpuIndex {
                     self.dims_vec4,
                 ))
             });
-            return self.dispatch_single_reused(padded_query.as_ref(), k, dispatch);
+            return self.dispatch_single_reused(query, k, dispatch);
         }
-        let results = self.dispatch_batched(padded_query.as_ref(), 1, k)?;
+        let results = self.dispatch_batched(query, 1, k)?;
         Ok(results.into_iter().next().unwrap_or_default())
     }
 
@@ -598,12 +641,8 @@ impl GpuIndex {
         query_rows: usize,
         k: usize,
     ) -> Result<Vec<Vec<Neighbor>>, GpuError> {
-        let padded_queries = if self.dims == self.dims_vec4 {
-            Cow::Borrowed(queries)
-        } else {
-            Cow::Owned(pad_to_vec4(queries, query_rows, self.dims, self.dims_vec4))
-        };
-        self.dispatch_batched(padded_queries.as_ref(), query_rows, k)
+        debug_assert_eq!(self.dims, self.dims_vec4);
+        self.dispatch_batched(queries, query_rows, k)
     }
 
     /// Batched GPU dispatch with automatic query sub-batching for buffer size limits.
@@ -897,29 +936,6 @@ fn cpu_dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-/// Pad a row-major matrix so each row has `padded_dims` columns (for vec4 alignment).
-fn pad_to_vec4(matrix: &[f32], rows: usize, dims: usize, padded_dims: usize) -> Vec<f32> {
-    if dims == padded_dims {
-        return matrix.to_vec();
-    }
-    let mut out = vec![0.0f32; rows * padded_dims];
-    for (row_idx, src_row) in matrix.chunks_exact(dims).enumerate().take(rows) {
-        let dst_start = row_idx * padded_dims;
-        out[dst_start..dst_start + dims].copy_from_slice(src_row);
-    }
-    out
-}
-
-/// Pad a single query vector to `padded_dims` for vec4 alignment.
-fn pad_query_vec4(query: &[f32], dims: usize, padded_dims: usize) -> Vec<f32> {
-    if dims == padded_dims {
-        return query.to_vec();
-    }
-    let mut out = vec![0.0f32; padded_dims];
-    out[..dims].copy_from_slice(&query[..dims]);
-    out
-}
-
 /// Select a wgpu adapter, either by explicit index or with automatic discrete-GPU preference.
 ///
 /// When `gpu_device_index` is `Some(idx)`, the adapter at that position in the enumeration
@@ -933,19 +949,34 @@ fn pad_query_vec4(query: &[f32], dims: usize, padded_dims: usize) -> Vec<f32> {
 fn select_adapter(
     instance: &wgpu::Instance,
     gpu_device_index: Option<usize>,
-) -> Result<wgpu::Adapter, GpuError> {
+) -> Result<(wgpu::Adapter, usize), GpuError> {
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
     if let Some(idx) = gpu_device_index {
-        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
         if idx >= adapters.len() {
             return Err(GpuError::DeviceIndexOutOfRange {
                 index: idx,
                 count: adapters.len(),
             });
         }
-        return Ok(adapters
-            .into_iter()
-            .nth(idx)
-            .expect("index validated above"));
+        return Ok((
+            adapters
+                .into_iter()
+                .nth(idx)
+                .expect("index validated above"),
+            idx,
+        ));
+    }
+
+    if let Some(idx) = adapters
+        .iter()
+        .position(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+    {
+        let discrete = adapters.into_iter().nth(idx).expect("index found above");
+        return Ok((discrete, idx));
+    }
+
+    if let Some(first) = adapters.into_iter().next() {
+        return Ok((first, 0));
     }
 
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -955,18 +986,7 @@ fn select_adapter(
     }))
     .map_err(|_| GpuError::AdapterNotFound)?;
 
-    // If the default pick is an integrated GPU, scan for a discrete one.
-    if adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu {
-        let all = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        if let Some(discrete) = all
-            .into_iter()
-            .find(|a: &wgpu::Adapter| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
-        {
-            return Ok(discrete);
-        }
-    }
-
-    Ok(adapter)
+    Ok((adapter, 0))
 }
 
 /// Information about a discovered GPU adapter, suitable for display and device selection.

@@ -28,7 +28,7 @@ struct ParsedInput {
 }
 
 /// Python-facing wrapper around [`NNdex`], exposed as `nndex.NNdex`.
-#[pyclass(name = "NNdex", unsendable)]
+#[pyclass(name = "NNdex")]
 pub struct PyNNdex {
     index: NNdex,
     rows: usize,
@@ -55,14 +55,14 @@ impl PyNNdex {
             let shape = array.shape();
             let (rows, dims) = (shape[0], shape[1]);
             if let Ok(slice) = array.as_slice() {
-                return build_index(slice, rows, dims, index_options);
+                return build_index(py, slice, rows, dims, index_options);
             }
             let values: Vec<f32> = array.as_array().iter().copied().collect();
-            return build_index(&values, rows, dims, index_options);
+            return build_index(py, &values, rows, dims, index_options);
         }
 
         let parsed = parse_input(py, data)?;
-        build_index(&parsed.values, parsed.rows, parsed.dims, index_options)
+        build_index(py, &parsed.values, parsed.rows, parsed.dims, index_options)
     }
 
     #[classmethod]
@@ -70,6 +70,7 @@ impl PyNNdex {
     #[pyo3(signature = (path, *, key=None, normalized=false, approx=false, backend="cpu", enable_cache=true, gpu_device_index=None))]
     fn from_file(
         _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
         path: &str,
         key: Option<&str>,
         normalized: bool,
@@ -80,9 +81,10 @@ impl PyNNdex {
     ) -> PyResult<Self> {
         let index_options =
             parse_index_options(normalized, approx, backend, enable_cache, gpu_device_index)?;
-        let matrix = load_matrix_from_disk(path, key)
+        let matrix = py
+            .detach(|| load_matrix_from_disk(path, key))
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        build_index(&matrix.values, matrix.rows, matrix.dims, index_options)
+        build_index(py, &matrix.values, matrix.rows, matrix.dims, index_options)
     }
 
     #[getter]
@@ -132,6 +134,7 @@ impl PyNNdex {
     ) -> PyResult<Py<PyAny>> {
         let output_dataframe = resolve_output_dataframe(py, dataframe, self.rows)?;
         let query_is_dataframe = detect_dataframe_kind(query).is_some();
+        let index = &self.index;
 
         if !query_is_dataframe && let Ok(array) = query.extract::<PyReadonlyArray1<'_, f32>>() {
             let dims = array.shape()[0];
@@ -142,9 +145,8 @@ impl PyNNdex {
                 )));
             }
             if let Ok(slice) = array.as_slice() {
-                let neighbors = self
-                    .index
-                    .search(slice, k)
+                let neighbors = py
+                    .detach(|| index.search(slice, k))
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let Some((kind, source_dataframe)) = &output_dataframe {
                     return neighbors_to_source_dataframe(
@@ -170,9 +172,8 @@ impl PyNNdex {
             if rows == 1
                 && let Ok(slice) = array.as_slice()
             {
-                let neighbors = self
-                    .index
-                    .search(slice, k)
+                let neighbors = py
+                    .detach(|| index.search(slice, k))
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let Some((kind, source_dataframe)) = &output_dataframe {
                     return neighbors_to_source_dataframe(
@@ -184,15 +185,14 @@ impl PyNNdex {
                 }
                 return neighbors_to_numpy(py, &neighbors);
             }
-            let values: Vec<f32> = if let Ok(slice) = array.as_slice() {
-                slice.to_vec()
+            let batch = if let Ok(slice) = array.as_slice() {
+                py.detach(|| index.search_batch(slice, rows, k))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             } else {
-                array.as_array().iter().copied().collect()
+                let values: Vec<f32> = array.as_array().iter().copied().collect();
+                py.detach(|| index.search_batch(&values, rows, k))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             };
-            let batch = self
-                .index
-                .search_batch(&values, rows, k)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             if let Some((kind, source_dataframe)) = &output_dataframe {
                 return neighbors_to_source_dataframe(py, &batch, *kind, source_dataframe.bind(py));
             }
@@ -208,9 +208,8 @@ impl PyNNdex {
         }
 
         if parsed.rows == 1 {
-            let neighbors = self
-                .index
-                .search(&parsed.values, k)
+            let neighbors = py
+                .detach(|| index.search(&parsed.values, k))
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
             if let Some((kind, source_dataframe)) = &output_dataframe {
                 return neighbors_to_source_dataframe(
@@ -223,9 +222,8 @@ impl PyNNdex {
             return neighbors_to_numpy(py, &neighbors);
         }
 
-        let batch = self
-            .index
-            .search_batch(&parsed.values, parsed.rows, k)
+        let batch = py
+            .detach(|| index.search_batch(&parsed.values, parsed.rows, k))
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
 
         if let Some((kind, source_dataframe)) = &output_dataframe {
@@ -238,12 +236,14 @@ impl PyNNdex {
 
 /// Construct a [`PyNNdex`] from a flat f32 slice, mapping Rust errors to Python exceptions.
 fn build_index(
+    py: Python<'_>,
     values: &[f32],
     rows: usize,
     dims: usize,
     index_options: IndexOptions,
 ) -> PyResult<PyNNdex> {
-    let index = NNdex::new(values, rows, dims, index_options)
+    let index = py
+        .detach(|| NNdex::new(values, rows, dims, index_options))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(PyNNdex { index, rows, dims })
 }
@@ -459,9 +459,8 @@ fn neighbors_to_numpy(py: Python<'_>, neighbors: &[Neighbor]) -> PyResult<Py<PyA
 
 /// Build a `(indices, similarities)` tuple of 2D numpy arrays directly from Rust.
 ///
-/// UPDATE: batch_neighbors_to_numpy maps &[Vec<Neighbor>] into Vec<Vec<u64>> and Vec<Vec<f32>>.
-/// For a batch of 16,384 queries, this allocates 32,768 separate heap vectors to satisfy the bridge interface.
-/// To improve, we allocate a single flat vector and instantly reshape it into a 2D matrix directly via NumPy.
+/// Allocates a single flat vector for indices and similarities and reshapes into
+/// `(rows, cols)` via NumPy to avoid per-query heap allocations.
 fn batch_neighbors_to_numpy(py: Python<'_>, batch: &[Vec<Neighbor>]) -> PyResult<Py<PyAny>> {
     let rows = batch.len();
     let cols = batch.first().map_or(0, |row| row.len());

@@ -225,3 +225,27 @@ def test_from_file_parquet_with_fixed_size_list_column(tmp_path: Path) -> None:
     indices, _scores = model.search(matrix[5], k=1)
 
     assert int(indices[0]) == 5
+
+
+def test_list_gpu_devices_exported() -> None:
+    from nndex import list_gpu_devices
+
+    devices = list_gpu_devices()
+    assert isinstance(devices, list)
+
+
+def test_concurrent_thread_search() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    matrix = np.eye(8, dtype=np.float32)
+    model = NNdex(matrix, normalized=True, backend="cpu")
+
+    def run_query(row_idx: int) -> int:
+        indices, _ = model.search(matrix[row_idx], k=1)
+        return int(indices[0])
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(run_query, range(8)))
+
+    assert results == list(range(8))
+

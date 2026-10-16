@@ -4,18 +4,20 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nndex::{BackendPreference, IndexOptions, NNdex};
 
 use common::{
-    PREDICT_BENCH_SIZES, criterion_with_runtime_defaults, generate_matrix, maybe_extreme_enabled,
-    should_run_case,
+    PREDICT_BENCH_SIZES, criterion_with_runtime_defaults, generate_matrix, should_run_case,
 };
 
 /// Scale GPU fit rows to reduce fixed dispatch overhead influence in benchmark timings.
+#[cfg(feature = "gpu")]
 const GPU_FIT_ROW_MULTIPLIER: usize = 100;
 /// Default safety cap for total matrix elements in scaled GPU fit benchmarks.
+#[cfg(feature = "gpu")]
 const GPU_FIT_MAX_ELEMENTS: usize = 100_000_000;
 
+#[cfg(feature = "gpu")]
 fn scaled_gpu_fit_rows(rows: usize, dims: usize) -> Option<usize> {
     let scaled_rows = rows.checked_mul(GPU_FIT_ROW_MULTIPLIER)?;
-    if maybe_extreme_enabled() {
+    if common::maybe_extreme_enabled() {
         return Some(scaled_rows);
     }
 

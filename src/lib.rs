@@ -221,6 +221,7 @@ impl NNdex {
             dims,
             normalized: options.normalized,
             approx: options.approx,
+            gpu_device_index: options.gpu_device_index,
             fingerprint: matrix_fingerprint,
         };
         #[cfg(feature = "gpu")]
@@ -304,7 +305,7 @@ impl NNdex {
             BackendImpl::Gpu(gpu) => {
                 let info = gpu.adapter_info();
                 Some(GpuDeviceInfo {
-                    index: 0,
+                    index: gpu.adapter_index(),
                     name: info.name.clone(),
                     driver: info.driver.clone(),
                     driver_info: info.driver_info.clone(),
@@ -697,7 +698,7 @@ fn cache_cpu_index(key: CpuCacheKey, index: &Arc<CpuIndex>) {
     }
 }
 
-/// Identity key for the GPU constructor cache, combining pointer, shape, and a sampled fingerprint.
+/// Identity key for the GPU constructor cache, combining pointer, shape, device, and a sampled fingerprint.
 #[cfg(feature = "gpu")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GpuCacheKey {
@@ -706,6 +707,7 @@ struct GpuCacheKey {
     dims: usize,
     normalized: bool,
     approx: bool,
+    gpu_device_index: Option<usize>,
     fingerprint: u64,
 }
 
@@ -743,14 +745,24 @@ fn constructor_cache_capacity() -> usize {
     CONSTRUCTOR_CACHE_CAPACITY
 }
 
-/// Compute a cheap hash fingerprint over sampled matrix elements for cache invalidation.
+/// Compute a fast hash fingerprint over matrix elements for cache invalidation.
+///
+/// Hashes the entire buffer for small matrices (`<= 4_096` floats) to prevent ABA
+/// collisions when temporary allocations reuse heap addresses or interior elements change,
+/// and samples 512 strided elements across the full buffer for larger matrices.
 #[cfg(any(feature = "cpu", feature = "gpu"))]
 fn sampled_matrix_fingerprint(values: &[f32]) -> u64 {
-    const SAMPLE_COUNT: usize = 1;
+    const FULL_HASH_MAX_FLOATS: usize = 4_096;
+    const SAMPLE_COUNT: usize = 512;
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     values.len().hash(&mut hasher);
     if values.is_empty() {
+        return hasher.finish();
+    }
+
+    if values.len() <= FULL_HASH_MAX_FLOATS {
+        bytemuck::cast_slice::<f32, u8>(values).hash(&mut hasher);
         return hasher.finish();
     }
 
@@ -1063,6 +1075,39 @@ mod tests {
             .search(&query, 5)
             .expect("second search should succeed");
         assert_eq!(first_result, second_result);
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn cpu_constructor_cache_invalidates_on_interior_mutation() {
+        let rows = 4usize;
+        let dims = 8usize;
+        let mut matrix = vec![
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 0
+            0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 1
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, // row 2
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, // row 3
+        ];
+        let options = IndexOptions {
+            normalized: false,
+            approx: false,
+            backend: BackendPreference::Cpu,
+            enable_cache: true,
+            gpu_device_index: None,
+        };
+
+        let first = NNdex::new(&matrix, rows, dims, options).expect("first index should succeed");
+        let query = vec![0.0_f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(first.search(&query, 1).expect("search works")[0].index, 1);
+
+        // Mutate interior rows in-place while keeping matrix.as_ptr(), matrix[0], and matrix[last] identical.
+        matrix[8 + 1] = 0.0;
+        matrix[8 + 4] = 1.0; // row 1 now points along dim 4
+        matrix[16 + 1] = 1.0;
+        matrix[16 + 2] = 0.0; // row 2 now points along dim 1
+
+        let second = NNdex::new(&matrix, rows, dims, options).expect("second index should succeed");
+        assert_eq!(second.search(&query, 1).expect("search works")[0].index, 2);
     }
 
     #[cfg(feature = "cpu")]
@@ -1557,5 +1602,80 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_exact_and_approx_search_match_cpu() {
+        let devices = list_gpu_devices();
+        if devices.is_empty() {
+            return;
+        }
+        let rows = 300usize;
+        let dims = 16usize;
+        let mut rng = ChaCha8Rng::seed_from_u64(2026);
+        let matrix: Vec<f32> = (0..rows * dims)
+            .map(|_| rng.random::<f32>() - 0.5)
+            .collect();
+        let queries: Vec<f32> = (0..4 * dims).map(|_| rng.random::<f32>() - 0.5).collect();
+
+        let cpu_exact = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                backend: BackendPreference::Cpu,
+                approx: false,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("cpu exact");
+        let Ok(gpu_exact) = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                backend: BackendPreference::Gpu,
+                approx: false,
+                gpu_device_index: Some(0),
+                ..IndexOptions::default()
+            },
+        ) else {
+            // Skip when running inside a sandbox or headless environment that blocks GPU device creation.
+            return;
+        };
+
+        if gpu_exact.backend() == ActiveBackend::Gpu {
+            assert_eq!(gpu_exact.gpu_info().expect("gpu info").index, 0);
+        }
+
+        let cpu_single = cpu_exact.search(&queries[..dims], 5).expect("cpu single");
+        let gpu_single = gpu_exact.search(&queries[..dims], 5).expect("gpu single");
+        let gpu_single_cached = gpu_exact
+            .search(&queries[..dims], 5)
+            .expect("gpu single cached");
+        assert_eq!(cpu_single[0].index, gpu_single[0].index);
+        assert_eq!(gpu_single, gpu_single_cached);
+
+        let gpu_approx = NNdex::new(
+            &matrix,
+            rows,
+            dims,
+            IndexOptions {
+                backend: BackendPreference::Gpu,
+                approx: true,
+                ..IndexOptions::default()
+            },
+        )
+        .expect("gpu approx");
+        let apx_single = gpu_approx.search(&queries[..dims], 5).expect("apx single");
+        let apx_batch = gpu_approx.search_batch(&queries, 4, 5).expect("apx batch");
+        assert_eq!(apx_single, apx_batch[0]);
+    }
+
+    #[test]
+    fn nndex_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NNdex>();
     }
 }
